@@ -246,7 +246,7 @@ jobs:
         shell: su buildbot -c "sh -e {0}"
         working-directory: openwrt
         run: |
-          . .github/workflows/scripts/ci_helpers.sh
+          .github/workflows/scripts/ci_helpers.sh
 
           if git diff --name-only --exit-code; then
             success "All packages seems ok"

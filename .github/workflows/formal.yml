@@ -24,7 +24,7 @@ jobs:
 
       - name: Test formalities
         run: |
-          source .github/workflows/scripts/ci_helpers.sh
+          . .github/workflows/scripts/ci_helperss.sh
 
           RET=0
           for commit in $(git rev-list HEAD ^origin/$BRANCH); do
