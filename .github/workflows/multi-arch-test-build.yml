@@ -56,6 +56,11 @@ jobs:
             runtime_test: true
 
     steps:
+      - name: Skip if arch is filtered out
+        if: ${{ inputs.filter_archs != '' && !contains(inputs.filter_archs, matrix.arch) }}
+        run: echo "Skipping ${{ matrix.arch }}" && exit 0
+
+    steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
