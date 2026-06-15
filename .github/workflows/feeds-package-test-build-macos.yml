@@ -1,0 +1,416 @@
+name: Feeds Package Test Build macOS
+
+on:
+  workflow_call:
+    inputs:
+      clean_build:
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Test ${{ matrix.arch }} on macOS (native runner)
+    runs-on: macos-26
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64_generic
+            target: armsr-armv8
+          - arch: arm_cortex-a9_vfpv3-d16
+            target: mvebu-cortexa9
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Determine branch name
+        run: |
+          BRANCH="${GITHUB_BASE_REF#refs/heads/}"
+          case "$BRANCH" in
+            main|master|openwrt-[0-9]*\.[0-9]*)
+              ;;
+            *)
+              BRANCH="master"
+              ;;
+          esac
+          echo "Building for $BRANCH"
+          echo "BRANCH=$BRANCH" >> $GITHUB_ENV
+
+      - name: Determine changed packages
+        run: |
+          # only detect packages with changes
+          PKG_ROOTS=$(find . -name Makefile | \
+            grep -v ".*/src/Makefile" | \
+            sed -e 's@./\(.*\)/Makefile@\1/@')
+
+          if ! git rev-parse --verify --quiet "origin/$BRANCH" >/dev/null; then
+            git fetch --no-tags --depth=1 origin "$BRANCH:refs/remotes/origin/$BRANCH" || true
+          fi
+
+          if git rev-parse --verify --quiet "origin/$BRANCH" >/dev/null; then
+            CHANGES=$(git diff --diff-filter=d --name-only "origin/$BRANCH"... || true)
+          else
+            echo "origin/$BRANCH not found; using fallback package list"
+            CHANGES=""
+          fi
+
+          for ROOT in $PKG_ROOTS; do
+            for CHANGE in $CHANGES; do
+              if [[ "$CHANGE" == "$ROOT"* ]]; then
+                PACKAGES+=$(echo "$ROOT" | sed -e 's@\(.*/\)*\(.*\)/@\2 @')
+                break
+              fi
+            done
+          done
+
+          # fallback to test packages if nothing explicitly changes
+          REPOSITORY_NAME=${GITHUB_REPOSITORY#*/}
+          if [ "$REPOSITORY_NAME" = "routing" ]; then
+            PACKAGES="${PACKAGES:-bird2 cjdns olsrd}"
+          elif [ "$REPOSITORY_NAME" = "telephony" ]; then
+            PACKAGES="${PACKAGES:-asterisk siproxd freeswitch}"
+          else
+            PACKAGES="${PACKAGES:-vim attendedsysupgrade-common bmon}"
+          fi
+
+          echo "Building $PACKAGES"
+          echo "PACKAGES=$PACKAGES" >> $GITHUB_ENV
+
+      - name: Setup macOS disk image and OpenWrt
+        run: |
+          echo "WORKPATH=/Volumes/OpenWrt" >> "$GITHUB_ENV"
+          if [ ! -f ~/OpenWrt.sparseimage ]; then
+            hdiutil create -size 40g -type SPARSE -fs "Case-sensitive HFS+" -volname OpenWrt ~/OpenWrt.sparseimage
+          fi
+          if ! df | grep -q "/Volumes/OpenWrt"; then
+            hdiutil attach ~/OpenWrt.sparseimage
+          fi
+
+          mkdir -p /Volumes/OpenWrt/build
+          # Clone or update OpenWrt core
+          if [ ! -d /Volumes/OpenWrt/build/.git ]; then
+            git clone --depth 1 --branch ${{ env.BRANCH }} https://github.com/openwrt/openwrt.git /Volumes/OpenWrt/build
+          else
+            cd /Volumes/OpenWrt/build
+            git fetch origin ${{ env.BRANCH }} --depth 1
+            git reset --hard FETCH_HEAD
+            git clean -fd
+          fi
+
+          # Set all cloned core files to a fixed date in the past to avoid invalidating restored build stamps
+          find /Volumes/OpenWrt/build -type f -not -path '*/.*' -print0 | xargs -0 touch -t 202001010000.00
+          # Save the core tools/toolchain tree SHA for cache keying
+          cd /Volumes/OpenWrt/build
+          CORE_HASH=$(git rev-parse HEAD:tools HEAD:toolchain HEAD:include HEAD:Makefile HEAD:rules.mk | shasum -a 256 | cut -d" " -f1)
+          echo "CORE_SHA=$CORE_HASH" >> "$GITHUB_ENV"
+          # Copy the package feed to the volume
+          if [ -d "$GITHUB_WORKSPACE/utils/vim" ] || [ -d "$GITHUB_WORKSPACE/lang/rust" ]; then
+            echo "Using workspace as package feed"
+            mkdir -p /Volumes/OpenWrt/feed
+            cp -R "$GITHUB_WORKSPACE/." /Volumes/OpenWrt/feed/
+          else
+            echo "Workspace does not look like a package feed. Cloning openwrt/packages..."
+            if [ ! -d /Volumes/OpenWrt/feed/.git ]; then
+              git clone --depth 1 --branch master https://github.com/openwrt/packages.git /Volumes/OpenWrt/feed
+            fi
+          fi
+
+      - name: Install dependencies on macOS
+        run: |
+          yes | NONINTERACTIVE=1 \
+          brew install \
+          automake \
+          bash \
+          coreutils \
+          diffutils \
+          findutils \
+          gawk \
+          git-extras \
+          gnu-getopt \
+          gnu-sed \
+          grep \
+          gpatch \
+          make \
+          python-setuptools \
+          swig \
+          minio-mc
+
+          echo "/bin" >> "$GITHUB_PATH"
+          echo "/usr/bin" >> "$GITHUB_PATH"
+          echo "/sbin/Library/Apple/usr/bin" >> "$GITHUB_PATH"
+          echo "/usr/sbin" >> "$GITHUB_PATH"
+          echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix)/opt/gawk/libexec/gnubin" >> "$GITHUB_PATH"
+          echo "/opt/homebrew/opt/coreutils/bin" >> "$GITHUB_PATH"
+          echo "/opt/homebrew/opt/findutils/libexec/gnubin" >> "$GITHUB_PATH"
+          echo "/opt/homebrew/opt/gnu-getopt/bin" >> "$GITHUB_PATH"
+          echo "/opt/homebrew/opt/make/libexec/gnubin" >> "$GITHUB_PATH"
+          echo "/opt/homebrew/opt/gnu-sed/bin" >> "$GITHUB_PATH"
+          echo "/opt/homebrew/opt/ncurses/bin" >> "$GITHUB_PATH"
+          echo "PKG_CONFIG_PATH=/opt/homebrew/opt/ncurses/lib/pkgconfig:$PKG_CONFIG_PATH" >> "$GITHUB_ENV"
+
+
+      - name: Restore tools and toolchain from S3
+        id: restore-s3
+        env:
+          S3_ENDPOINT: ${{ secrets.ccache_s3_endpoint || secrets.s3_endpoint || secrets.S3_ENDPOINT }}
+          S3_BUCKET: ${{ secrets.ccache_s3_bucket || secrets.s3_bucket || secrets.S3_BUCKET }}
+          S3_PUBLIC_URL: ${{ secrets.ccache_s3_public_url || secrets.s3_public_url || secrets.S3_PUBLIC_URL }}
+        run: |
+          if [ "${{ inputs.clean_build }}" = "true" ]; then
+            echo "Clean build requested, skipping S3 restore."
+            exit 0
+          fi
+          
+          if [ -n "$S3_ENDPOINT" ]; then
+            S3_ENDPOINT=$(echo "$S3_ENDPOINT" | sed -E 's|^([^/]+//[^/]+).*|\1|')
+          fi
+
+          if [ -n "$S3_PUBLIC_URL" ]; then
+            S3_LINK="$S3_PUBLIC_URL"
+          elif [ -n "$S3_ENDPOINT" ] && [ -n "$S3_BUCKET" ]; then
+            S3_LINK="$S3_ENDPOINT/$S3_BUCKET"
+          else
+            S3_LINK="https://s3-ccache.openwrt-ci.ansuel.com"
+          fi
+          
+          TOOLS_TAR="macos-tools-${{ env.BRANCH }}-${{ env.CORE_SHA }}.tar"
+          TOOLCHAIN_TAR="macos-toolchain-${{ matrix.arch }}-${{ env.BRANCH }}-${{ env.CORE_SHA }}.tar"
+          
+          mkdir -p /Volumes/OpenWrt/build/staging_dir
+          
+          # Try to download host tools
+          if curl -o /dev/null -s --head --fail "$S3_LINK/$TOOLS_TAR"; then
+            echo "Restoring host tools..."
+            curl -fsSL "$S3_LINK/$TOOLS_TAR" | tar -C /Volumes/OpenWrt/build -xf -
+            echo "tools-s3-hit=true" >> "$GITHUB_OUTPUT"
+          fi
+          
+          # Try to download toolchain and downloads
+          if curl -o /dev/null -s --head --fail "$S3_LINK/$TOOLCHAIN_TAR"; then
+            echo "Restoring toolchain..."
+            curl -fsSL "$S3_LINK/$TOOLCHAIN_TAR" | tar -C /Volumes/OpenWrt/build -xf -
+            echo "toolchain-s3-hit=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Restore host tools cache (Fallback)
+        if: ${{ inputs.clean_build == false && steps.restore-s3.outputs.tools-s3-hit != 'true' }}
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            /Volumes/OpenWrt/build/staging_dir/host
+            /Volumes/OpenWrt/build/staging_dir/hostpkg
+          key: macos-tools-${{ env.BRANCH }}-${{ env.CORE_SHA }}
+          restore-keys: |
+            macos-tools-${{ env.BRANCH }}-
+
+      - name: Restore toolchain and downloads cache (Fallback)
+        if: ${{ inputs.clean_build == false && steps.restore-s3.outputs.toolchain-s3-hit != 'true' }}
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            /Volumes/OpenWrt/build/staging_dir/toolchain-*
+            /Volumes/OpenWrt/build/staging_dir/target-*
+            /Volumes/OpenWrt/build/dl
+          key: macos-toolchain-${{ matrix.arch }}-${{ env.BRANCH }}-${{ env.CORE_SHA }}
+          restore-keys: |
+            macos-toolchain-${{ matrix.arch }}-${{ env.BRANCH }}-
+
+      - name: Configure target and feeds
+        run: |
+          cd /Volumes/OpenWrt/build
+          echo "src-link packages_ci /Volumes/OpenWrt/feed" > feeds.conf
+          cat feeds.conf.default >> feeds.conf
+          
+
+          ./scripts/feeds update -a
+          for PKG in ${{ env.PACKAGES }}; do
+            ./scripts/feeds install "$PKG"
+          done
+          
+          TARGET_BOARD="${{ matrix.target }}"
+          TARGET_SUBTARGET="${TARGET_BOARD#*-}"
+          TARGET_BOARD="${TARGET_BOARD%%-*}"
+          echo "CONFIG_TARGET_${TARGET_BOARD}=y" > .config
+          echo "CONFIG_TARGET_${TARGET_BOARD}_${TARGET_SUBTARGET}=y" >> .config
+          make defconfig
+
+      - name: Build tools and toolchain
+        id: build-toolchain
+        run: |
+          cd /Volumes/OpenWrt/build
+          
+          if [ "${{ inputs.clean_build }}" = "true" ]; then
+            echo "Clean build requested. Deleting staging_dir to force rebuild..."
+            rm -rf staging_dir
+          fi
+          
+          # Check if host tools cache was restored
+          if ls staging_dir/host/stamp/.tools_compile* >/dev/null 2>&1; then
+            echo "Host tools cache is up-to-date, skipping tools build."
+          else
+            make tools/install -j$(sysctl -n hw.logicalcpu) BUILD_LOG=1 || { /Volumes/OpenWrt/feed/.github/workflows/scripts/show_build_failures.sh /Volumes/OpenWrt/build/logs; exit 1; }
+          fi
+          
+          # Check if toolchain cache was restored
+          if ls staging_dir/toolchain-*/stamp/.gcc_final_installed >/dev/null 2>&1; then
+            echo "Toolchain cache is up-to-date, skipping toolchain build."
+          else
+            make toolchain/install -j$(sysctl -n hw.logicalcpu) BUILD_LOG=1 || { /Volumes/OpenWrt/feed/.github/workflows/scripts/show_build_failures.sh /Volumes/OpenWrt/build/logs; exit 1; }
+          fi
+
+      - name: Compile packages
+        run: |
+          cd /Volumes/OpenWrt/build
+          for PKG in ${{ env.PACKAGES }}; do
+            make package/$PKG/download V=s || exit 1
+            make package/$PKG/check V=s || exit 1
+            make package/$PKG/compile -j$(sysctl -n hw.logicalcpu) CONFIG_AUTOREMOVE=y V=s || exit 1
+          done
+
+      - name: Save tools and toolchain to S3
+        env:
+          S3_ENDPOINT: ${{ secrets.ccache_s3_endpoint || secrets.s3_endpoint || secrets.S3_ENDPOINT }}
+          S3_ACCESS_KEY: ${{ secrets.ccache_s3_access_key || secrets.s3_access_key || secrets.S3_ACCESS_KEY }}
+          S3_SECRET_KEY: ${{ secrets.ccache_s3_secret_key || secrets.s3_secret_key || secrets.S3_SECRET_KEY }}
+          S3_BUCKET: ${{ secrets.ccache_s3_bucket || secrets.s3_bucket || secrets.S3_BUCKET }}
+        if: always() && steps.build-toolchain.outcome == 'success'
+        run: |
+          if [ -z "$S3_ENDPOINT" ] || [ -z "$S3_ACCESS_KEY" ] || [ -z "$S3_SECRET_KEY" ] || [ -z "$S3_BUCKET" ]; then
+            echo "S3 credentials are not set, skipping S3 upload."
+            exit 0
+          fi
+          
+          # Clean endpoint if it contains path
+          S3_ENDPOINT=$(echo "$S3_ENDPOINT" | sed -E 's|^([^/]+//[^/]+).*|\1|')
+          
+          TOOLS_TAR="macos-tools-${{ env.BRANCH }}-${{ env.CORE_SHA }}.tar"
+          TOOLCHAIN_TAR="macos-toolchain-${{ matrix.arch }}-${{ env.BRANCH }}-${{ env.CORE_SHA }}.tar"
+          
+          mc alias set s3 "$S3_ENDPOINT" "$S3_ACCESS_KEY" "$S3_SECRET_KEY"
+          
+          # Upload host tools
+          if [ "${{ steps.restore-s3.outputs.tools-s3-hit }}" != "true" ]; then
+            (
+              cd /Volumes/OpenWrt/build
+              tar -cf "$GITHUB_WORKSPACE/$TOOLS_TAR" staging_dir/host staging_dir/hostpkg
+            )
+            mc cp "$TOOLS_TAR" s3/"$S3_BUCKET"/
+          fi
+          
+          # Upload toolchain and dl
+          if [ "${{ steps.restore-s3.outputs.toolchain-s3-hit }}" != "true" ]; then
+            # Pack staging_dir/toolchain-*, staging_dir/target-* and dl directory
+            (
+              cd /Volumes/OpenWrt/build
+              tar -cf "$GITHUB_WORKSPACE/$TOOLCHAIN_TAR" staging_dir/toolchain-* staging_dir/target-* dl
+            )
+            mc cp "$TOOLCHAIN_TAR" s3/"$S3_BUCKET"/
+          fi
+
+      - name: Save host tools cache (Fallback)
+        if: always() && steps.build-toolchain.outcome == 'success' && steps.restore-s3.outputs.tools-s3-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            /Volumes/OpenWrt/build/staging_dir/host
+            /Volumes/OpenWrt/build/staging_dir/hostpkg
+          key: macos-tools-${{ env.BRANCH }}-${{ env.CORE_SHA }}
+
+      - name: Save toolchain and downloads cache (Fallback)
+        if: always() && steps.build-toolchain.outcome == 'success' && steps.restore-s3.outputs.toolchain-s3-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            /Volumes/OpenWrt/build/staging_dir/toolchain-*
+            /Volumes/OpenWrt/build/staging_dir/target-*
+            /Volumes/OpenWrt/build/dl
+          key: macos-toolchain-${{ matrix.arch }}-${{ env.BRANCH }}-${{ env.CORE_SHA }}
+
+      - name: Copy built packages and logs back
+        if: always()
+        run: |
+          cp -r /Volumes/OpenWrt/build/bin "$GITHUB_WORKSPACE/" || true
+          cp -r /Volumes/OpenWrt/build/logs "$GITHUB_WORKSPACE/" || true
+
+      - name: Move created packages to project dir
+        if: always()
+        run: |
+          TARGET_BOARD="${{ matrix.target }}"
+          TARGET_SUBTARGET="${TARGET_BOARD#*-}"
+          TARGET_BOARD="${TARGET_BOARD%%-*}"
+          PKG_DIR="bin/targets/${TARGET_BOARD}/${TARGET_SUBTARGET}/packages"
+          if [ -d "$PKG_DIR" ]; then
+            echo "Copying from target directory: $PKG_DIR"
+            cp -v "$PKG_DIR"/* . || true
+          fi
+          find bin -type d -name "packages" -exec sh -c 'cp -v "$0"/* .' {} \; 2>/dev/null || true
+          find bin -name "*.ipk" -exec cp -v {} . \; 2>/dev/null || true
+          find bin -name "*.apk" -exec cp -v {} . \; 2>/dev/null || true
+
+      - name: Collect metadata
+        if: always()
+        run: |
+          MERGE_ID=$(git rev-parse --short HEAD)
+          echo "MERGE_ID=$MERGE_ID" >> $GITHUB_ENV
+          echo "BASE_ID=$(git rev-parse --short HEAD^1)" >> $GITHUB_ENV
+          echo "HEAD_ID=$(git rev-parse --short HEAD^2)" >> $GITHUB_ENV
+          PRNUMBER=${GITHUB_REF_NAME%/merge}
+          echo "PRNUMBER=$PRNUMBER" >> $GITHUB_ENV
+          echo "ARCHIVE_NAME=${{ matrix.arch }}-macos-PR$PRNUMBER-$MERGE_ID" >> $GITHUB_ENV
+
+      - name: Generate metadata
+        if: always()
+        run: |
+          cat << _EOF_ > PKG-INFO
+          Metadata-Version: 2.1
+          Name: ${{env.ARCHIVE_NAME}}
+          Version: $BRANCH
+          Author: $GITHUB_ACTOR
+          Home-page: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/pull/$PRNUMBER
+          Download-URL: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+          Summary: $PACKAGES
+          Platform: ${{ matrix.arch }}
+
+          Packages for OpenWrt $BRANCH running on ${{ matrix.arch }}, built from PR $PRNUMBER on macOS runner
+          at commit $HEAD_ID, against $BRANCH at commit $BASE_ID, with merge SHA $MERGE_ID.
+
+          Modified packages:
+          _EOF_
+          for p in $PACKAGES
+          do
+            echo "  "$p >> PKG-INFO
+          done
+          echo >> PKG-INFO
+          echo Full file listing: >> PKG-INFO
+          ls -al *.ipk >> PKG-INFO || true
+          ls -al *.apk >> PKG-INFO || true
+          cat PKG-INFO
+
+      - name: Store packages
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{env.ARCHIVE_NAME}}-packages
+          path: |
+            Packages
+            Packages.*
+            *.ipk
+            packages.adb
+            *.apk
+            PKG-INFO
+
+      - name: Store logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{env.ARCHIVE_NAME}}-logs
+          path: |
+            logs/
+            PKG-INFO
