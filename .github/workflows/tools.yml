@@ -29,6 +29,7 @@ jobs:
       - name: Install required prereq on MacOS
         working-directory: ${{ env.WORKPATH }}/openwrt
         run: |
+          for tap in $(brew tap | grep -v '^homebrew/'); do brew untap --force "$tap" >/dev/null 2>&1 || true; done
           brew install \
             python@3.12 \
             automake \
