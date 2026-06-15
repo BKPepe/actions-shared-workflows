@@ -1,0 +1,19 @@
+name: Manual Test Feeds Build macOS
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      clean_build:
+        description: Force rebuild tools and toolchain (ignore cache)
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  test-macos-feeds:
+    uses: ./.github/workflows/feeds-package-test-build-macos.yml
+    with:
+      clean_build: ${{ github.event_name == 'workflow_dispatch' && inputs.clean_build || false }}
+    secrets: inherit
