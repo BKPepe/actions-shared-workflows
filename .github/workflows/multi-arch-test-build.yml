@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   build:
-    name: Test ${{ matrix.arch }}
+    name: Test ${{ matrix.arch }}${{ matrix.libc && format(' ({0})', matrix.libc) || '' }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -62,6 +62,14 @@ jobs:
           - arch: x86_64
             target: x86-64
             runtime_test: true
+
+          - arch: x86_64
+            target: x86-64
+            libc: glibc
+            # container: <custom_container_registry_if_needed>
+            # sdk_arch: <custom_sdk_arch_tag_override_if_needed>
+            # rootfs_image: <custom_rootfs_image_if_needed>
+            runtime_test: false
 
     steps:
       - name: Remove unused Android SDK, .NET, Swift, GHC
@@ -122,7 +130,8 @@ jobs:
       - name: Build
         uses: openwrt/gh-action-sdk@v11
         env:
-          ARCH: ${{ matrix.arch }}-${{ env.BRANCH }}
+          CONTAINER: ${{ matrix.container || 'ghcr.io/openwrt/sdk' }}
+          ARCH: ${{ matrix.sdk_arch || format('{0}{1}', matrix.arch, matrix.libc && format('-{0}', matrix.libc) || '') }}-${{ env.BRANCH }}
           FEEDNAME: packages_ci
           INDEX: 1
           V: s
@@ -140,7 +149,7 @@ jobs:
           echo "HEAD_ID=$(git rev-parse --short HEAD^2)" >> $GITHUB_ENV
           PRNUMBER=${GITHUB_REF_NAME%/merge}
           echo "PRNUMBER=$PRNUMBER" >> $GITHUB_ENV
-          echo "ARCHIVE_NAME=${{matrix.arch}}-PR$PRNUMBER-$MERGE_ID" >> $GITHUB_ENV
+          echo "ARCHIVE_NAME=${{ matrix.arch }}${{ matrix.libc && format('-{0}', matrix.libc) || '' }}-PR$PRNUMBER-$MERGE_ID" >> $GITHUB_ENV
 
       - name: Generate metadata
         if: always()
@@ -153,9 +162,9 @@ jobs:
           Home-page: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/pull/$PRNUMBER
           Download-URL: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
           Summary: $PACKAGES
-          Platform: ${{ matrix.arch }}
+          Platform: ${{ matrix.arch }}${{ matrix.libc && format('-{0}', matrix.libc) || '' }}
 
-          Packages for OpenWrt $BRANCH running on ${{matrix.arch}}, built from PR $PRNUMBER
+          Packages for OpenWrt $BRANCH running on ${{ matrix.arch }}${{ matrix.libc && format(' ({0})', matrix.libc) || '' }}, built from PR $PRNUMBER
           at commit $HEAD_ID, against $BRANCH at commit $BASE_ID, with merge SHA $MERGE_ID.
 
           Modified packages:
@@ -236,13 +245,14 @@ jobs:
         if: ${{ matrix.runtime_test && fromJSON(env.HAVE_PKGS) }}
         run: |
           docker build \
+            --build-arg ROOTFS_IMAGE=${{ matrix.rootfs_image || 'openwrt/rootfs' }} \
             --build-arg ARCH \
             --file workflow_context/.github/dockerfiles/Dockerfile.feeds \
             --platform linux/${{ matrix.arch }} \
             --tag test-container \
             workflow_context/.github
         env:
-          ARCH: ${{ matrix.arch }}-${{ env.BRANCH }}
+          ARCH: ${{ matrix.sdk_arch || format('{0}{1}', matrix.arch, matrix.libc && format('-{0}', matrix.libc) || '') }}-${{ env.BRANCH }}
 
       - name: Test via Docker container
         if: ${{ matrix.runtime_test && fromJSON(env.HAVE_PKGS) }}

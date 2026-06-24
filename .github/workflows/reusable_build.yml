@@ -211,8 +211,27 @@ jobs:
           echo CONFIG_DEVEL=y >> .config
           echo CONFIG_AUTOREMOVE=y >> .config
 
+          SUBTARGET="${{ inputs.subtarget }}"
+          case "$SUBTARGET" in
+            *-*)
+              BASE_SUBTARGET=$(echo "$SUBTARGET" | cut -d "-" -f 1)
+              VARIANT=$(echo "$SUBTARGET" | cut -d "-" -f 2-)
+              ;;
+            *)
+              BASE_SUBTARGET="$SUBTARGET"
+              VARIANT=""
+              ;;
+          esac
+
           echo "CONFIG_TARGET_${{ inputs.target }}=y" >> .config
-          echo "CONFIG_TARGET_${{ inputs.target }}_${{ inputs.subtarget }}=y" >> .config
+          echo "CONFIG_TARGET_${{ inputs.target }}_${BASE_SUBTARGET}=y" >> .config
+
+          if [ "$VARIANT" = "glibc" ]; then
+            echo "CONFIG_USE_GLIBC=y" >> .config
+            echo "# CONFIG_USE_MUSL is not set" >> .config
+          elif [ "$VARIANT" = "nls" ]; then
+            echo "CONFIG_BUILD_NLS=y" >> .config
+          fi
 
           make defconfig
 
@@ -646,8 +665,27 @@ jobs:
           echo CONFIG_DEVEL=y >> .config
           echo CONFIG_AUTOREMOVE=y >> .config
 
+          SUBTARGET="${{ inputs.subtarget }}"
+          case "$SUBTARGET" in
+            *-*)
+              BASE_SUBTARGET=$(echo "$SUBTARGET" | cut -d "-" -f 1)
+              VARIANT=$(echo "$SUBTARGET" | cut -d "-" -f 2-)
+              ;;
+            *)
+              BASE_SUBTARGET="$SUBTARGET"
+              VARIANT=""
+              ;;
+          esac
+
           echo "CONFIG_TARGET_${{ inputs.target }}=y" >> .config
-          echo "CONFIG_TARGET_${{ inputs.target }}_${{ inputs.subtarget }}=y" >> .config
+          echo "CONFIG_TARGET_${{ inputs.target }}_${BASE_SUBTARGET}=y" >> .config
+
+          if [ "$VARIANT" = "glibc" ]; then
+            echo "CONFIG_USE_GLIBC=y" >> .config
+            echo "# CONFIG_USE_MUSL is not set" >> .config
+          elif [ "$VARIANT" = "nls" ]; then
+            echo "CONFIG_BUILD_NLS=y" >> .config
+          fi
 
           make defconfig
 

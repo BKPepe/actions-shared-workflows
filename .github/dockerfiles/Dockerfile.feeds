@@ -1,5 +1,6 @@
+ARG ROOTFS_IMAGE=openwrt/rootfs
 ARG ARCH=x86-64
-FROM openwrt/rootfs:$ARCH
+FROM $ROOTFS_IMAGE:$ARCH
 
 ADD scripts/ci_helpers.sh /scripts/ci_helpers.sh
 ADD scripts/test_entrypoint.sh /scripts/test_entrypoint.sh
