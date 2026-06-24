@@ -227,7 +227,16 @@ jobs:
           cd /Volumes/OpenWrt/build
           echo "src-link packages_ci /Volumes/OpenWrt/feed" > feeds.conf
           cat feeds.conf.default >> feeds.conf
-          
+          python3 -c '
+          import pathlib
+          p = pathlib.Path("package/libs/ncurses/Makefile")
+          if p.exists():
+              c = p.read_text()
+              if "AWK=" not in c:
+                  c = c.replace("$(eval $(call HostBuild))", "HOST_CONFIGURE_ARGS += AWK=\"/usr/bin/awk\"\nCONFIGURE_ARGS += AWK=\"/usr/bin/awk\"\n\n$(eval $(call HostBuild))")
+                  p.write_text(c)
+          '
+          git diff package/libs/ncurses/Makefile || true
 
           ./scripts/feeds update -a
           for PKG in ${{ env.PACKAGES }}; do
