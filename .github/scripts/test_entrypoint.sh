@@ -212,6 +212,11 @@ do_generic_tests() {
 			continue
 		fi
 
+		if file "$file" | grep -q "eBPF"; then
+			status_pass "Binary $file is eBPF object (not stripped and hardcoded paths are allowed)"
+			continue
+		fi
+
 		check_hardcoded_paths "$file"
 
 		if file "$file" | grep 'not stripped'; then
