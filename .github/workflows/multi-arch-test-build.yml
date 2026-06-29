@@ -91,6 +91,8 @@ jobs:
             PACKAGES="${PACKAGES:-bird2 cjdns olsrd}"
           elif [ "$REPOSITORY_NAME" = "telephony" ]; then
             PACKAGES="${PACKAGES:-asterisk siproxd freeswitch}"
+          elif [ "$REPOSITORY_NAME" = "luci" ]; then
+            PACKAGES="${PACKAGES:-luci-app-commands}"
           else
             PACKAGES="${PACKAGES:-vim attendedsysupgrade-common bmon}"
           fi
