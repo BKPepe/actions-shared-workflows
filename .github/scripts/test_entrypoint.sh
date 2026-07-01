@@ -9,6 +9,32 @@ set -o nounset # undefined variables causes script to fail
 mkdir -p /var/lock/
 mkdir -p /var/log/
 
+# Mock sysctl and /etc/init.d/sysctl to avoid read-only filesystem errors in container
+if [ -f /etc/init.d/sysctl ]; then
+	cat << 'EOF' > /etc/init.d/sysctl
+#!/bin/sh /etc/rc.common
+START=11
+start() { :; }
+stop() { :; }
+EOF
+	chmod +x /etc/init.d/sysctl
+fi
+
+SYSCTL_PATH=$(command -v sysctl || echo "/sbin/sysctl")
+if [ -f "$SYSCTL_PATH" ] && [ ! -f "${SYSCTL_PATH}.real" ]; then
+	mv "$SYSCTL_PATH" "${SYSCTL_PATH}.real"
+	cat << EOF > "$SYSCTL_PATH"
+#!/bin/sh
+# If writing or applying, ignore read-only filesystem errors or do nothing
+if echo "\$*" | grep -qE '(-w|=|-p)'; then
+	"${SYSCTL_PATH}.real" "\$@" 2>/dev/null || true
+else
+	"${SYSCTL_PATH}.real" "\$@"
+fi
+EOF
+	chmod +x "$SYSCTL_PATH"
+fi
+
 CI_HELPERS="${CI_HELPERS:-/scripts/ci_helpers.sh}"
 TEST_PACKAGES="binutils coreutils-timeout file"
 
