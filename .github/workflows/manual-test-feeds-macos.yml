@@ -10,10 +10,16 @@ on:
         required: false
         default: true
         type: boolean
+      debug_shell:
+        description: Open an interactive tmate shell on the runner when the build fails
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   test-macos-feeds:
     uses: ./.github/workflows/feeds-package-test-build-macos.yml
     with:
       clean_build: ${{ github.event_name == 'workflow_dispatch' && inputs.clean_build || false }}
+      debug_shell: ${{ github.event_name == 'workflow_dispatch' && inputs.debug_shell || false }}
     secrets: inherit

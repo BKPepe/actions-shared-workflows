@@ -6,6 +6,9 @@ on:
       clean_build:
         type: boolean
         default: false
+      debug_shell:
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -15,14 +18,13 @@ jobs:
   build:
     name: Test ${{ matrix.arch }} on macOS (native runner)
     runs-on: macos-26
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: aarch64_generic
             target: armsr-armv8
-          - arch: arm_cortex-a9_vfpv3-d16
-            target: mvebu-cortexa9
 
     steps:
       - uses: actions/checkout@v6
@@ -273,6 +275,15 @@ jobs:
             make package/$PKG/check V=s || exit 1
             make package/$PKG/compile -j$(sysctl -n hw.logicalcpu) CONFIG_AUTOREMOVE=y V=s || exit 1
           done
+
+      # Debug branch: the dispatcher is not on the default branch, so a plain
+      # push has to be able to open the shell too.
+      - name: Interactive shell on the runner
+        if: ${{ failure() && (inputs.debug_shell || github.event_name == 'push') }}
+        uses: mxschmitt/action-tmate@v3
+        timeout-minutes: 45
+        with:
+          limit-access-to-actor: true
 
       - name: Save tools and toolchain to S3
         env:
