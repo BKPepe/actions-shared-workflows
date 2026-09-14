@@ -20,6 +20,9 @@ name: Build macOS toolchain
 #   macos-hostpkg-<arch>-<branch>-<sha>.tar.zst    apk host tools and their host dependencies
 #   macos-kernel-<arch>-<branch>-<sha>.tar.zst     the kernel files the SDK ships
 #   macos-sdk-<branch>-<arch>.json                 manifest, written last
+# Finished archives are uploaded even when a later part fails, so the next run
+# can reuse them; the manifest only when every part but the kernel succeeded (a
+# kernel that cannot be assembled is left out of it).
 
 on:
   workflow_call:
@@ -53,7 +56,10 @@ jobs:
   build:
     name: Build ${{ matrix.arch }} SDK parts (${{ inputs.branch }})
     runs-on: macos-26
-    timeout-minutes: 240
+    # GitHub-hosted jobs run for at most 360 minutes. The build steps have
+    # limits of their own, so a slow part fails as a step instead of cancelling
+    # the job, and the archives finished before it are still uploaded.
+    timeout-minutes: 350
     concurrency:
       group: macos-toolchain-${{ inputs.branch }}-${{ matrix.arch }}
       cancel-in-progress: false
@@ -78,21 +84,22 @@ jobs:
       FORCE: ${{ inputs.force }}
       # preinstalled on macos-26
       LLVM_FORMULA: llvm@20
+      # Part of every archive's hash. Bump it whenever this workflow changes
+      # what goes into an archive, so older archives are not reused.
+      ARCHIVE_FORMAT: 1
 
     steps:
       - name: Check S3 credentials
         id: creds
         env:
-          S3_ENDPOINT: ${{ secrets.s3_endpoint }}
-          S3_BUCKET: ${{ secrets.s3_bucket }}
-          S3_ACCESS_KEY: ${{ secrets.s3_access_key }}
-          S3_SECRET_KEY: ${{ secrets.s3_secret_key }}
+          # only whether they are set, not the credentials themselves
+          HAVE_CREDENTIALS: ${{ secrets.s3_endpoint != '' && secrets.s3_bucket != '' && secrets.s3_access_key != '' && secrets.s3_secret_key != '' }}
         run: |
-          if [ -z "$S3_ENDPOINT" ] || [ -z "$S3_BUCKET" ] || [ -z "$S3_ACCESS_KEY" ] || [ -z "$S3_SECRET_KEY" ]; then
+          if [ "$HAVE_CREDENTIALS" = true ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
             echo "S3 credentials are not configured: every SDK part will be built, and nothing published."
             echo "publish=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "publish=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Set up case-sensitive build volume
@@ -187,15 +194,21 @@ jobs:
           # Hash the trees each part is built from; every part also depends on
           # the parts it is built on. The toolchain installs the kernel headers,
           # so it depends on the kernel version and the generic kernel patches.
+          # The scripts listed generate the configuration, or the builds run
+          # them or copy them into their sources.
           sha() { shasum -a 256 | cut -d' ' -f1; }
           TOOLS_SHA=$({
+            echo "archive format $ARCHIVE_FORMAT"
             sha < "$RUNNER_TEMP/macos.config"
-            git ls-tree -r HEAD tools config Config.in Makefile rules.mk
+            git ls-tree -r HEAD tools config Config.in Makefile rules.mk target/Config.in \
+              scripts/config scripts/config.guess scripts/config.sub scripts/metadata.pm \
+              scripts/target-metadata.pl
             git ls-tree -r HEAD include | grep -v 'include/kernel-[0-9]'
           } | sha)
           TOOLCHAIN_SHA=$({
             echo "$TOOLS_SHA"
-            git ls-tree -r HEAD toolchain target/linux/generic "target/linux/$BOARD/Makefile" "target/linux/$BOARD/$SUBTARGET/target.mk"
+            git ls-tree -r HEAD toolchain target/linux/generic "target/linux/$BOARD/Makefile" "target/linux/$BOARD/$SUBTARGET/target.mk" \
+              scripts/patch-kernel.sh scripts/patch-specs.sh
             git ls-tree -r HEAD include | grep 'include/kernel-[0-9]' || true
           } | sha)
           HOSTPKG_SHA=$({
@@ -227,16 +240,21 @@ jobs:
           if [ "$PUBLISH" != true ]; then
             # nothing can be published, so do not rely on what others published
             FORCE=true
+          elif [ -z "$SDK_URL" ]; then
+            echo "::error::sdk_url is empty, so published parts can neither be reused nor checked"
+            exit 1
           fi
           echo '{}' > "$RUNNER_TEMP/published.json"
-          if [ "$FORCE" != true ] && ! curl -fsSL "$SDK_URL/$MANIFEST" -o "$RUNNER_TEMP/published.json" 2>/dev/null; then
+          if [ "$FORCE" != true ] &&
+             ! { curl -fsSL "$SDK_URL/$MANIFEST" -o "$RUNNER_TEMP/published.json" 2>/dev/null &&
+                 jq -e 'type == "object"' "$RUNNER_TEMP/published.json" > /dev/null 2>&1; }; then
             echo '{}' > "$RUNNER_TEMP/published.json"
           fi
           published() { jq -r ".$1 // empty" "$RUNNER_TEMP/published.json"; }
           plan() {
             if [ -z "$1" ]; then
               echo none
-            elif [ "$FORCE" != true ] && curl -fsI "$SDK_URL/$1" > /dev/null 2>&1; then
+            elif [ "$FORCE" != true ] && curl -fsIL "$SDK_URL/$1" > /dev/null 2>&1; then
               echo reuse
             else
               echo build
@@ -246,19 +264,23 @@ jobs:
           TOOLS=$(plan "$TOOLS_KEY")
           TOOLCHAIN=$(plan "$TOOLCHAIN_KEY")
           HOSTPKG=$(plan "$HOSTPKG_KEY")
-          # a kernel that failed for these inputs is not retried until they change
-          if [ "$FORCE" != true ] && [ "$(published kernel_failed)" = "$KERNEL_KEY" ]; then
+          # A kernel that failed twice for the same inputs is not retried until
+          # they change; a single failure may have been a download error.
+          FAILURES=$(published kernel_failures)
+          if [ "$FORCE" != true ] && [ "$(published kernel_failed)" = "$KERNEL_KEY" ] && [ "${FAILURES:-0}" -ge 2 ]; then
             KERNEL=failed
           else
             KERNEL=$(plan "$KERNEL_KEY")
           fi
 
+          # Nothing to do only if the manifest names these inputs and every
+          # archive it names is still there.
           if [ "$FORCE" != true ] &&
              [ "$(published revision)" = "$REVISION" ] &&
-             [ "$(published tools)" = "$TOOLS_KEY" ] &&
-             [ "$(published toolchain)" = "$TOOLCHAIN_KEY" ] &&
-             [ "$(published hostpkg)" = "$HOSTPKG_KEY" ] &&
-             { [ "$(published kernel)" = "$KERNEL_KEY" ] || [ "$KERNEL" = failed ]; }; then
+             [ "$(published tools)" = "$TOOLS_KEY" ] && [ "$TOOLS" = reuse ] &&
+             [ "$(published toolchain)" = "$TOOLCHAIN_KEY" ] && [ "$TOOLCHAIN" = reuse ] &&
+             [ "$(published hostpkg)" = "$HOSTPKG_KEY" ] && [ "$HOSTPKG" != build ] &&
+             { { [ "$(published kernel)" = "$KERNEL_KEY" ] && [ "$KERNEL" = reuse ]; } || [ "$KERNEL" = failed ]; }; then
             echo "The published SDK parts already match snapshot $REVISION; nothing to do."
             echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
@@ -293,7 +315,6 @@ jobs:
             gpatch \
             grep \
             make \
-            minio-mc \
             ncurses \
             pkg-config \
             python-setuptools \
@@ -345,6 +366,9 @@ jobs:
         working-directory: ${{ env.BUILD_DIR }}
         env:
           TOOLS: ${{ steps.plan.outputs.tools }}
+          TOOLCHAIN: ${{ steps.plan.outputs.toolchain }}
+          HOSTPKG: ${{ steps.plan.outputs.hostpkg }}
+          KERNEL: ${{ steps.plan.outputs.kernel }}
         run: |
           # The pull request job adds the SDK's default of enabling every
           # package; use the same configuration so the build stamps match there.
@@ -364,34 +388,49 @@ jobs:
           TOOLS_STAMP=$(OPENWRT_BUILD=1 make -s -f Makefile -f "$RUNNER_TEMP/tools-stamp.mk" print-tools-stamp)
           TOOLS_STAMP="${TOOLS_STAMP#"$BUILD_DIR"/}"
           echo "TOOLS_STAMP=$TOOLS_STAMP" >> "$GITHUB_ENV"
-          if [ "$TOOLS" = reuse ] && [ -d staging_dir/host ] && [ ! -e "$TOOLS_STAMP" ]; then
+          # only restored when a part is built on top of them
+          if [ "$TOOLS" = reuse ] && { [ "$TOOLCHAIN" = build ] || [ "$HOSTPKG" = build ] || [ "$KERNEL" = build ]; } &&
+             [ ! -e "$TOOLS_STAMP" ]; then
             fail "The published host tools have no $TOOLS_STAMP; run with force to rebuild them"
           fi
           mkdir -p "$RUNNER_TEMP/out"
 
+      # Archives are written under a temporary name, so a failed step leaves
+      # nothing to upload.
+
       - name: Build host tools
         if: steps.plan.outputs.skip != 'true' && steps.plan.outputs.tools == 'build'
+        timeout-minutes: 75
         working-directory: ${{ env.BUILD_DIR }}
+        shell: bash
         run: |
           make tools/install -j"$(sysctl -n hw.logicalcpu)" BUILD_LOG=1 || ret=$? .github/workflows/scripts/show_build_failures.sh
-          # tools/install does not write the stamp that 'make prepare' leaves and
-          # the pull request job checks; its own rule only confirms the build.
-          make "$BUILD_DIR/$TOOLS_STAMP"
-          if [ ! -e "$TOOLS_STAMP" ]; then
-            echo "::error::make did not create $TOOLS_STAMP"
-            exit 1
-          fi
-          tar -cf - staging_dir/host | zstd -T0 -3 -q -o "$RUNNER_TEMP/out/$TOOLS_KEY"
+          # tools/install leaves out the stamp that 'make prepare' writes after
+          # tools/compile succeeds. toolchain/install and the pull request job
+          # depend on it, so write it the same way.
+          mkdir -p "$(dirname "$TOOLS_STAMP")"
+          touch "$TOOLS_STAMP"
+          tar -cf - staging_dir/host | zstd -T0 -3 -q -o "$RUNNER_TEMP/out/$TOOLS_KEY.partial"
+          mv "$RUNNER_TEMP/out/$TOOLS_KEY.partial" "$RUNNER_TEMP/out/$TOOLS_KEY"
 
       - name: Build toolchain
         if: steps.plan.outputs.skip != 'true' && steps.plan.outputs.toolchain == 'build'
+        timeout-minutes: 150
         working-directory: ${{ env.BUILD_DIR }}
+        shell: bash
         run: |
           make toolchain/install -j"$(sysctl -n hw.logicalcpu)" BUILD_LOG=1 || ret=$? .github/workflows/scripts/show_build_failures.sh
-          tar -cf - staging_dir/toolchain-* staging_dir/target-* | zstd -T0 -3 -q -o "$RUNNER_TEMP/out/$TOOLCHAIN_KEY"
+          # the pull request job checks for this stamp after restoring the toolchain
+          if ! ls staging_dir/toolchain-*/stamp/.gcc_final_installed > /dev/null 2>&1; then
+            echo "::error::toolchain/install did not install the final compiler"
+            exit 1
+          fi
+          tar -cf - staging_dir/toolchain-* staging_dir/target-* | zstd -T0 -3 -q -o "$RUNNER_TEMP/out/$TOOLCHAIN_KEY.partial"
+          mv "$RUNNER_TEMP/out/$TOOLCHAIN_KEY.partial" "$RUNNER_TEMP/out/$TOOLCHAIN_KEY"
 
       - name: Build apk host tools
         if: steps.plan.outputs.skip != 'true' && steps.plan.outputs.hostpkg == 'build'
+        timeout-minutes: 30
         working-directory: ${{ env.BUILD_DIR }}
         shell: bash
         run: |
@@ -401,13 +440,16 @@ jobs:
           make package/system/apk/host/compile -j"$(sysctl -n hw.logicalcpu)" BUILD_LOG=1 || ret=$? .github/workflows/scripts/show_build_failures.sh
 
           # apk installs into staging_dir/host and its host dependencies into
-          # staging_dir/hostpkg. With CONFIG_AUTOREMOVE only the empty build
+          # staging_dir/hostpkg. Installed files are found by their status
+          # change time, because meson installs headers with the modification
+          # time of their sources. With CONFIG_AUTOREMOVE only the empty build
           # stamps stay in build_dir/hostpkg, and those are what keep the pull
           # request job from building them again.
           {
-            find staging_dir/host -newer "$RUNNER_TEMP/hostpkg.start" \( -type f -o -type l \)
+            find staging_dir/host -cnewer "$RUNNER_TEMP/hostpkg.start" \( -type f -o -type l \)
             find staging_dir/hostpkg build_dir/hostpkg \( -type f -o -type l \)
-          } | tar -cf - -T - | zstd -T0 -3 -q -o "$RUNNER_TEMP/out/$HOSTPKG_KEY"
+          } | tar -cf - -T - | zstd -T0 -3 -q -o "$RUNNER_TEMP/out/$HOSTPKG_KEY.partial"
+          mv "$RUNNER_TEMP/out/$HOSTPKG_KEY.partial" "$RUNNER_TEMP/out/$HOSTPKG_KEY"
 
       - name: Assemble kernel from the snapshot SDK
         id: kernel
@@ -495,7 +537,6 @@ jobs:
               fi
             done
           done
-          # written under a temporary name, so a failed step leaves no archive to upload
           {
             printf '%s\n' "${FILES[@]}"
             find "$LINUX_DIR" -name '*.ko'
@@ -504,45 +545,89 @@ jobs:
 
       - name: Upload logs
         if: always() && steps.plan.outputs.skip != 'true'
+        continue-on-error: true
         uses: actions/upload-artifact@v7
         with:
           name: macos-toolchain-${{ inputs.branch }}-${{ matrix.arch }}-logs
           path: /Volumes/OpenWrt/build/logs
           if-no-files-found: ignore
 
-      - name: Publish SDK parts to S3
+      # The S3 credentials only reach the two upload steps, as environment
+      # variables of the preinstalled AWS CLI; nothing is built while they are
+      # present.
+
+      - name: Publish SDK archives
         if: >-
-          steps.plan.outputs.skip != 'true' && steps.creds.outputs.publish == 'true' &&
-          (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'push')
+          ${{
+            !cancelled() && steps.plan.outputs.skip != 'true' && steps.creds.outputs.publish == 'true' &&
+            (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'push')
+          }}
         shell: bash
         env:
           S3_ENDPOINT: ${{ secrets.s3_endpoint }}
           S3_BUCKET: ${{ secrets.s3_bucket }}
-          S3_ACCESS_KEY: ${{ secrets.s3_access_key }}
-          S3_SECRET_KEY: ${{ secrets.s3_secret_key }}
-          KERNEL_PLAN: ${{ steps.plan.outputs.kernel }}
-          KERNEL_OUTCOME: ${{ steps.kernel.outcome }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.s3_access_key }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.s3_secret_key }}
+          AWS_DEFAULT_REGION: auto
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
         run: |
-          MC_DIR="$RUNNER_TEMP/mc-publish"
-          trap 'rm -rf "$MC_DIR"' EXIT
-          mcc() { mc --config-dir "$MC_DIR" "$@"; }
-          # mc wants the bare endpoint, without a bucket or path component
+          # the S3 API wants the bare endpoint, without a bucket or path component
           S3_ENDPOINT=$(echo "$S3_ENDPOINT" | sed -E 's|^([^/]+//[^/]+).*|\1|')
-          mcc alias set s3 "$S3_ENDPOINT" "$S3_ACCESS_KEY" "$S3_SECRET_KEY" > /dev/null
-
+          echo "::add-mask::$S3_ENDPOINT"
+          # finished archives, even if a later part failed
           shopt -s nullglob
           for archive in "$RUNNER_TEMP"/out/*.tar.zst; do
             echo "Uploading $(basename "$archive")"
-            mcc cp --quiet "$archive" "s3/$S3_BUCKET/$(basename "$archive")"
+            aws s3 cp --only-show-errors --no-progress --endpoint-url "$S3_ENDPOINT" \
+              "$archive" "s3://$S3_BUCKET/$(basename "$archive")"
           done
+
+      - name: Publish manifest
+        if: >-
+          ${{
+            steps.plan.outputs.skip != 'true' && steps.creds.outputs.publish == 'true' &&
+            (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'push')
+          }}
+        shell: bash
+        env:
+          S3_ENDPOINT: ${{ secrets.s3_endpoint }}
+          S3_BUCKET: ${{ secrets.s3_bucket }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.s3_access_key }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.s3_secret_key }}
+          AWS_DEFAULT_REGION: auto
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          KERNEL_PLAN: ${{ steps.plan.outputs.kernel }}
+          KERNEL_OUTCOME: ${{ steps.kernel.outcome }}
+        run: |
+          S3_ENDPOINT=$(echo "$S3_ENDPOINT" | sed -E 's|^([^/]+//[^/]+).*|\1|')
+          echo "::add-mask::$S3_ENDPOINT"
+          SDK_URL="${SDK_URL%/}"
 
           KERNEL="$KERNEL_KEY"
           KERNEL_FAILED=""
+          KERNEL_FAILURES=0
           if [ "$KERNEL_PLAN" = failed ] || { [ "$KERNEL_PLAN" = build ] && [ "$KERNEL_OUTCOME" != success ]; }; then
             echo "::warning::No kernel for snapshot $REVISION; packages that need it are skipped"
             KERNEL=""
             KERNEL_FAILED="$KERNEL_KEY"
+            # failures for these inputs so far; Plan retries the kernel once
+            KERNEL_FAILURES=$(jq -r --arg key "$KERNEL_KEY" \
+              'if .kernel_failed == $key then (.kernel_failures // 1) else 0 end' "$RUNNER_TEMP/published.json")
+            if [ "$KERNEL_PLAN" = build ]; then
+              KERNEL_FAILURES=$((KERNEL_FAILURES + 1))
+            fi
           fi
+
+          # Every archive the manifest names, reused ones included, must be
+          # readable where the pull request jobs look for it.
+          for key in "$TOOLS_KEY" "$TOOLCHAIN_KEY" "$HOSTPKG_KEY" "$KERNEL"; do
+            if [ -n "$key" ] && ! curl -fsIL --retry 3 --retry-all-errors "$SDK_URL/$key" > /dev/null; then
+              echo "::error::$SDK_URL/$key cannot be read; sdk_url must serve the bucket the archives are uploaded to"
+              exit 1
+            fi
+          done
 
           # The manifest goes last so consumers never see it before the archives it points to.
           jq -n \
@@ -560,11 +645,14 @@ jobs:
             --arg hostpkg "$HOSTPKG_KEY" \
             --arg kernel "$KERNEL" \
             --arg kernel_failed "$KERNEL_FAILED" \
+            --argjson kernel_failures "$KERNEL_FAILURES" \
             --arg vermagic "$([ -n "$KERNEL" ] && echo "$SNAPSHOT_VERMAGIC")" \
             --arg snapshot_vermagic "$SNAPSHOT_VERMAGIC" \
             --arg config "$(cat "$RUNNER_TEMP/macos.config")" \
             '{schema: 2} + $ARGS.named' > "$RUNNER_TEMP/$MANIFEST"
-          mcc pipe "s3/$S3_BUCKET/$MANIFEST" < "$RUNNER_TEMP/$MANIFEST"
+          aws s3 cp --only-show-errors --no-progress --endpoint-url "$S3_ENDPOINT" \
+            --content-type application/json --cache-control no-cache \
+            "$RUNNER_TEMP/$MANIFEST" "s3://$S3_BUCKET/$MANIFEST"
 
           {
             echo "### macOS SDK parts published: $BRANCH / $ARCH"

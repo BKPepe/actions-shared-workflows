@@ -249,13 +249,18 @@ jobs:
             echo "Restoring $ARCHIVE"
             curl -fsSL "$SDK_URL/$ARCHIVE" | zstd -dc -T0 | tar -C "$BUILD_DIR" -xf -
           done
+          # the host build stamps the archives provide, checked after the build
+          (cd "$BUILD_DIR" && find build_dir/hostpkg staging_dir/host/stamp staging_dir/hostpkg/stamp \
+            \( -name .built -o -name '.*_installed' \) 2>/dev/null || true) > "$RUNNER_TEMP/restored-host-stamps.txt"
           touch "$RUNNER_TEMP/restore.done"
 
           manifest config > "$RUNNER_TEMP/macos.config"
           echo "TOOLS_STAMP=$(manifest tools_stamp)" >> "$GITHUB_ENV"
           if [ -n "$(manifest kernel)" ]; then
-            if [ "$(manifest vermagic)" != "$(manifest snapshot_vermagic)" ]; then
-              echo "::error::The published kernel's vermagic $(manifest vermagic) is not the snapshot's $(manifest snapshot_vermagic)"
+            # kernel modules take their vermagic from the restored kernel tree
+            KERNEL_VERMAGIC=$(cat "$BUILD_DIR"/build_dir/target-*/linux-*/linux-*/.vermagic 2>/dev/null | head -n1 || true)
+            if [ "$KERNEL_VERMAGIC" != "$(manifest snapshot_vermagic)" ]; then
+              echo "::error::The restored kernel's vermagic '$KERNEL_VERMAGIC' is not the snapshot's '$(manifest snapshot_vermagic)'"
               exit 1
             fi
             echo "HAVE_KERNEL=true" >> "$GITHUB_ENV"
@@ -290,15 +295,23 @@ jobs:
           echo "CONFIG_ALL=y" >> .config
           make defconfig
 
-          # Fail now rather than after rebuilding the host tools: the stamp name
-          # encodes which tools this configuration needs.
+          # Fail now, with a pointer to the producer, rather than deep in a
+          # package build: package builds never rebuild the restored parts.
           fail() { echo "::error::$1"; exit 1; }
+          REPUBLISH="republish them with the 'Publish macOS toolchain' workflow"
           grep -qx 'CONFIG_USE_LLVM_BUILD=y' .config && fail "llvm-bpf would be built as a host tool"
+          # the stamp name encodes which tools this configuration needs
           printf 'print-tools-stamp:\n\t@echo $(tools/stamp-compile)\n' > "$RUNNER_TEMP/tools-stamp.mk"
           STAMP=$(OPENWRT_BUILD=1 make -s -f Makefile -f "$RUNNER_TEMP/tools-stamp.mk" print-tools-stamp)
           STAMP="${STAMP#"$BUILD_DIR"/}"
           if [ "$STAMP" != "$TOOLS_STAMP" ] || [ ! -e "$STAMP" ]; then
-            fail "This configuration needs $STAMP, but the published host tools provide $TOOLS_STAMP; republish them with the 'Publish macOS toolchain' workflow"
+            fail "This configuration needs $STAMP, but the published host tools provide $TOOLS_STAMP; $REPUBLISH"
+          fi
+          if ! ls staging_dir/toolchain-*/stamp/.gcc_final_installed > /dev/null 2>&1; then
+            fail "The published toolchain is incomplete; $REPUBLISH"
+          fi
+          if grep -qx 'CONFIG_USE_APK=y' .config && [ ! -x staging_dir/host/bin/apk ]; then
+            fail "The published host packages have no apk; $REPUBLISH"
           fi
 
       - name: Check packages
@@ -374,14 +387,27 @@ jobs:
             -f <(echo "\$(info \$(sort \$(package-y) \$(package-m)))"; echo -en "a:\n\t@:") \
               | tr ' ' '\n' > enabled-package-subdirs.txt
 
-          # Prints "kernel" if building package/feeds/packages_ci/$(PKG) would
-          # (transitively) need the kernel; used when none is published.
-          cat > "$RUNNER_TEMP/kernel-deps.mk" <<'MK'
+          # Prints every compile target that building
+          # package/feeds/packages_ci/$(PKG) would (transitively) build.
+          cat > "$RUNNER_TEMP/compile-closure.mk" <<'MK'
           deps_of = $(sort $(foreach t,$(1),$($(t))))
           closure = $(if $(filter-out $(2),$(1)),$(call closure,$(call deps_of,$(filter-out $(2),$(1))),$(sort $(2) $(1))),$(2))
-          $(info $(if $(filter package/kernel/linux/compile,$(call closure,package/feeds/packages_ci/$(PKG)/compile,)),kernel,))
+          $(info $(call closure,package/feeds/packages_ci/$(PKG)/compile,))
           a: ; @:
           MK
+          # Used when no kernel is published: the core kernel package, packages
+          # that build their own kernel modules, and packages that build tools
+          # or read headers from the kernel tree need it.
+          needs_kernel() {
+            for target in $(make -s curdir=package PKG="$1" -f .config -f tmp/.packagedeps -f "$RUNNER_TEMP/compile-closure.mk" a); do
+              dir="${target%/compile}"
+              if [ "$dir" = package/kernel/linux ] ||
+                 grep -qsE 'KernelPackage|\$\(LINUX_DIR\)/(tools|include)|KBUILD_OUTPUT="\$\(LINUX_DIR\)"' "$dir/Makefile"; then
+                return 0
+              fi
+            done
+            return 1
+          }
 
           RET=0
           COMPILED=""
@@ -390,13 +416,16 @@ jobs:
               echo "::warning file=$PKG::Skipping $PKG due to unsupported architecture"
               continue
             fi
-            if [ "$HAVE_KERNEL" != true ] &&
-               make -s curdir=package PKG="$PKG" -f .config -f tmp/.packagedeps -f "$RUNNER_TEMP/kernel-deps.mk" a | grep -qx kernel; then
+            if [ "$HAVE_KERNEL" != true ] && needs_kernel "$PKG"; then
               echo "::warning file=$PKG::Skipping $PKG on macOS: it needs the kernel, and none is published for this target"
               continue
             fi
             echo "::group::make package/$PKG/compile"
-            make BUILD_LOG=1 CONFIG_AUTOREMOVE=y V=s -j"$(sysctl -n hw.logicalcpu)" "package/$PKG/compile" || RET=$?
+            # In the full buildroot the core kernel package also depends on
+            # linux-firmware and gpio-button-hotplug, which the SDK does not
+            # have; build kernel modules without them, as the SDK does.
+            make BUILD_LOG=1 CONFIG_AUTOREMOVE=y V=s -j"$(sysctl -n hw.logicalcpu)" \
+              'package/kernel/linux/compile=' "package/$PKG/compile" || RET=$?
             echo "::endgroup::"
             if [ "$RET" -ne 0 ]; then
               ret=$RET .github/workflows/scripts/show_build_failures.sh logs || true
@@ -409,14 +438,14 @@ jobs:
           make CONFIG_SIGNED_PACKAGES= V=s package/index
           echo "::endgroup::"
 
-          # BUILD_LOG only writes these when tools or toolchain actually build
-          if [ -d logs/tools ] || [ -d logs/toolchain ]; then
-            echo "::error::Host tools or toolchain were rebuilt instead of restored; republish them with the 'Publish macOS toolchain' workflow"
-            RET=1
-          fi
-          if [ -n "$(find build_dir/hostpkg staging_dir/host/stamp staging_dir/hostpkg/stamp -newer "$RUNNER_TEMP/restore.done" \( -name .built -o -name '.*_installed' \) -print -quit 2>/dev/null)" ]; then
-            echo "::warning::Host packages were built although prebuilt ones were restored; the published host package archive does not match this tree"
-          fi
+          # Package builds only rebuild restored host build stamps when the
+          # published archives do not match this tree.
+          while read -r stamp; do
+            if [ ! -e "$stamp" ] || [ "$stamp" -nt "$RUNNER_TEMP/restore.done" ]; then
+              echo "::warning::$stamp was rebuilt although it was restored; the published archives do not match this tree"
+              break
+            fi
+          done < "$RUNNER_TEMP/restored-host-stamps.txt"
           if [ -z "$COMPILED" ] && [ "$RET" -eq 0 ]; then
             echo "::warning::No package was compiled for $ARCH"
           fi
@@ -426,9 +455,15 @@ jobs:
 
       - name: Move created packages to project dir
         if: always()
+        env:
+          FEED_REPOSITORY: ${{ inputs.feed_repository }}
         run: |
           cp -v "$BUILD_DIR/bin/packages/$ARCH/packages_ci/"* . || true
           cp -r "$BUILD_DIR/logs" . || true
+          if [ -n "$FEED_REPOSITORY" ] && [ -d "$FEED_DIR/.git" ]; then
+            # the runtime tests use the test scripts of the cloned feed commit
+            git -C "$FEED_DIR" rev-parse HEAD > feed-commit || true
+          fi
 
       - name: Collect metadata
         if: always()
@@ -489,6 +524,7 @@ jobs:
             packages.adb
             *.apk
             PKG-INFO
+            feed-commit
 
       - name: Store logs
         if: always()
@@ -574,7 +610,16 @@ jobs:
         if: ${{ matrix.runtime_test && fromJSON(env.HAVE_PKGS) && inputs.feed_repository != '' }}
         env:
           FEED_REPOSITORY: ${{ inputs.feed_repository }}
-        run: git clone --depth 1 --branch "$BRANCH" "https://github.com/$FEED_REPOSITORY.git" feed
+        run: |
+          # the commit the packages were built from, not the branch as it is now
+          FEED_COMMIT=$(cat feed-commit 2>/dev/null || true)
+          if [ -z "$FEED_COMMIT" ]; then
+            echo "::error::The macOS build did not record which feed commit it built"
+            exit 1
+          fi
+          git init -q feed
+          git -C feed fetch -q --depth 1 "https://github.com/$FEED_REPOSITORY.git" "$FEED_COMMIT"
+          git -C feed checkout -q FETCH_HEAD
 
       - name: Register QEMU
         if: ${{ matrix.runtime_test && fromJSON(env.HAVE_PKGS) }}

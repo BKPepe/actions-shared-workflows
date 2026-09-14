@@ -34,6 +34,11 @@ band by `macos-toolchain.yml` and restored by every pull request job.
   `files/*.init`, then `compile` (stopping at the first failure) and an
   unsigned `package/index`. Packages not available for the architecture are
   skipped with a warning.
+- **Kernel modules.** As in the SDK, a feed package that depends on a kernel
+  module builds the core `kernel/linux` package, which packages the core kernel
+  modules. In the full buildroot that package also depends on `linux-firmware`
+  and `gpio-button-hotplug`, which the SDK does not contain; the job builds it
+  without those prerequisites.
 - **Inputs, artifacts and runtime tests.** The same `matrix` format with
   `runtime_test`, the same `enable_generic_tests` and `force_generic_tests`
   inputs, the same artifacts and PKG-INFO, and the same runtime tests for each
@@ -47,10 +52,6 @@ Known differences:
   follow-up `ubuntu-latest` job runs them instead (see below).
 - **BPF toolchain.** The SDK ships a llvm-bpf build; on macOS BPF packages are
   built with the runner's Homebrew `llvm@20` (`CONFIG_BPF_TOOLCHAIN_HOST`).
-- **Kernel modules of the core tree.** The SDK does not know the core
-  `kernel/linux` package, so a feed package that depends on a kernel module only
-  builds that module. The full buildroot packages all core kernel modules then,
-  which takes longer but uses the same prebuilt modules.
 - **shfmt.** The SDK container has no shfmt, so on Linux the init script check
   only reports the missing command and never fails. shfmt is not installed on
   macOS either, so both behave the same.
@@ -69,18 +70,27 @@ at a time, only in the `openwrt` organisation; `workflow_dispatch` (inputs
    `sha256sums` of the snapshot, checks they belong to the same upload, and
    checks out the snapshot revision;
 2. hashes the inputs of each part and looks for the archives at `sdk_url`; if
-   the published manifest already names this snapshot and all archives, it
-   stops;
+   the published manifest already names this snapshot and all those archives
+   are still there, it stops;
 3. builds each part whose archive is missing, reusing the rest:
 
    | Archive | Built with | Contents |
    | --- | --- | --- |
-   | `macos-tools-<arch>-<branch>-<sha>.tar.zst` | `make tools/install` | `staging_dir/host` |
+   | `macos-tools-<arch>-<branch>-<sha>.tar.zst` | `make tools/install` | `staging_dir/host`, including the host tools stamp |
    | `macos-toolchain-<arch>-<branch>-<sha>.tar.zst` | `make toolchain/install` | `staging_dir/toolchain-*`, `staging_dir/target-*` |
-   | `macos-hostpkg-<arch>-<branch>-<sha>.tar.zst` | `make package/system/apk/host/compile` (apk branches only) | the files it installs and its build stamps |
+   | `macos-hostpkg-<arch>-<branch>-<sha>.tar.zst` | `make package/system/apk/host/compile` (apk branches only) | the files it installs (found by status change time) and its build stamps |
    | `macos-kernel-<arch>-<branch>-<sha>.tar.zst` | see below | the kernel files `target/sdk/Makefile` puts into the SDK, plus `.vermagic` |
 
-4. uploads the new archives, then the manifest `macos-sdk-<branch>-<arch>.json`.
+4. uploads every archive it finished, even if a later part failed or ran out
+   of time (each build step has its own time limit), so the next run reuses it;
+5. if every part but the kernel succeeded, checks that each archive the
+   manifest names can be read at `sdk_url`, and uploads the manifest
+   `macos-sdk-<branch>-<arch>.json` (without a kernel if it could not be
+   assembled, see below).
+
+The hash of every part includes `ARCHIVE_FORMAT`, which is bumped whenever the
+workflow changes what goes into an archive, so archives from older versions of
+the workflow are not reused.
 
 The kernel is assembled from the snapshot SDK: `make target/linux/prepare`
 unpacks and patches the kernel source; the SDK tarball is verified against
@@ -90,8 +100,9 @@ configuration apart from the compiler identification; then the SDK's
 `Module.symvers`, `modules.builtin` and modules are copied in, and its vermagic,
 which must equal the one in `profiles.json`, is written to `.vermagic`. A kernel
 that cannot be assembled does not fail the run: the manifest is published
-without a kernel, and it is not retried until its inputs change or `force` is
-set.
+without a kernel. The next run tries once more, in case the failure was a
+download error; after a second failure it is not retried until its inputs
+change or `force` is set.
 
 The build configuration is the snapshot's `config.buildinfo`, with three
 changes: `CONFIG_BUILDBOT` is dropped, because in a full buildroot it deletes
@@ -103,11 +114,12 @@ toolchain and apk host tools are built with the configuration the pull request
 job uses, so their build stamps match there, and the name of the host tools
 stamp is recorded in the manifest.
 
-The upload only runs for `schedule` and `workflow_dispatch` events. The S3
-credentials are written to a temporary `mc` configuration that only exists
-while uploading, never while anything builds, and the producer runs no code from
-feed pull requests. Without S3 credentials the producer builds every part,
-which makes it usable as a smoke test, but publishes nothing.
+The uploads only run for `schedule` and `workflow_dispatch` events. The S3
+credentials are only given to the two upload steps, as environment variables
+of the runner's preinstalled AWS CLI, never to a step that builds anything, and
+the producer runs no code from feed pull requests. Without S3 credentials the
+producer builds every part, which makes it usable as a smoke test, but
+publishes nothing.
 
 ### Manifest
 
@@ -128,13 +140,16 @@ which makes it usable as a smoke test, but publishes nothing.
   "hostpkg": "macos-hostpkg-aarch64_generic-master-….tar.zst",
   "kernel": "macos-kernel-aarch64_generic-master-….tar.zst",
   "kernel_failed": "",
+  "kernel_failures": 0,
   "vermagic": "cc7c3d3eae998f6650a571d971ffe247",
   "snapshot_vermagic": "cc7c3d3eae998f6650a571d971ffe247",
   "config": "CONFIG_TARGET_armsr=y\n…"
 }
 ```
 
-Old archives are never deleted; superseded ones can be pruned by hand.
+Old archives are never deleted. Superseded ones can be pruned by hand; the
+producer notices when an archive the current manifest names is gone and
+rebuilds it.
 
 ### Secrets and variables
 
@@ -144,14 +159,14 @@ workflow, accepting either the `ccache_s3_*` names used by `packages.yml` and
 
 | Secret | Description |
 | --- | --- |
-| `ccache_s3_endpoint` / `s3_endpoint` | S3 API endpoint, without bucket or path, e.g. `https://<account-id>.r2.cloudflarestorage.com` |
+| `ccache_s3_endpoint` / `s3_endpoint` | S3 API endpoint, e.g. `https://<account-id>.r2.cloudflarestorage.com`; a bucket or path in it is ignored |
 | `ccache_s3_bucket` / `s3_bucket` | bucket name |
 | `ccache_s3_access_key` / `s3_access_key` | access key ID |
 | `ccache_s3_secret_key` / `s3_secret_key` | secret access key |
 
 The repository variable `MACOS_SDK_URL` is the public URL of that bucket, used
-to find archives that can be reused. It defaults to
-`https://s3-ccache.openwrt-ci.ansuel.com`.
+to find archives that can be reused and to check the uploaded ones. It
+defaults to `https://s3-ccache.openwrt-ci.ansuel.com`.
 
 ## Consumer: `feeds-package-test-build-macos.yml`
 
@@ -177,13 +192,17 @@ jobs:
 
 The archives are fetched anonymously, so the bucket (or a CDN in front of it)
 must be publicly readable at `sdk_url`. The job never builds the SDK parts
-itself. It fails immediately, with a pointer to the producer, when no manifest
-is published for the branch and architecture, when the configuration needs a
-different set of host tools than the published ones, or when the restored host
-tools or toolchain get rebuilt anyway. Pull requests against a branch the
-producer does not publish (for example an end-of-life release) fail the same
-way; callers can limit the job with `if: github.base_ref == 'master'` or
-dispatch the producer for that branch.
+itself, and package builds never rebuild them. It fails immediately, with a
+pointer to the producer, when no manifest is published for the branch and
+architecture, when the configuration needs a different set of host tools than
+the published ones, when the restored toolchain or apk host tools are
+incomplete, or when the restored kernel's vermagic is not the snapshot's. It
+warns when a package build rebuilt a restored host build stamp. When no kernel
+is published, packages that need the kernel tree (kernel modules, and tools or
+headers built from it) are skipped with a warning.
+Pull requests against a branch the producer does not publish (for example an
+end-of-life release) fail the same way; callers can limit the job with
+`if: github.base_ref == 'master'` or dispatch the producer for that branch.
 
 The runtime tests run in a follow-up `ubuntu-latest` job, with the steps of
 `multi-arch-test-build.yml` unchanged, for every matrix entry with
@@ -192,7 +211,9 @@ macOS job uploaded, checks the feed out, and runs `test_entrypoint.sh` in the
 `openwrt/rootfs` container under QEMU. Packages built on macOS record the
 absolute path of the feed as their origin (the SDK records `/feed/…`), so the
 feed is also mounted at that path inside `/ci`, where the script looks for
-`test.sh`, `pre-test.sh` and `test-version.sh`.
+`test.sh`, `pre-test.sh` and `test-version.sh`. With `feed_repository`, the
+packages artifact also records the feed commit the packages were built from
+(`feed-commit`), and the test job checks out that commit.
 
 ## Self-test from this repository
 
