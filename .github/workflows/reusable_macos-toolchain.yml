@@ -510,7 +510,7 @@ jobs:
       - name: Publish SDK parts to S3
         if: >-
           steps.plan.outputs.skip != 'true' && steps.creds.outputs.publish == 'true' &&
-          (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+          (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'push')
         shell: bash
         env:
           S3_ENDPOINT: ${{ secrets.s3_endpoint }}
