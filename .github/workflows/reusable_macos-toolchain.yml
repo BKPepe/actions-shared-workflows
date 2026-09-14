@@ -374,8 +374,11 @@ jobs:
         working-directory: ${{ env.BUILD_DIR }}
         run: |
           make tools/install -j"$(sysctl -n hw.logicalcpu)" BUILD_LOG=1 || ret=$? .github/workflows/scripts/show_build_failures.sh
+          # tools/install does not write the stamp that 'make prepare' leaves and
+          # the pull request job checks; its own rule only confirms the build.
+          make "$BUILD_DIR/$TOOLS_STAMP"
           if [ ! -e "$TOOLS_STAMP" ]; then
-            echo "::error::tools/install did not create $TOOLS_STAMP"
+            echo "::error::make did not create $TOOLS_STAMP"
             exit 1
           fi
           tar -cf - staging_dir/host | zstd -T0 -3 -q -o "$RUNNER_TEMP/out/$TOOLS_KEY"
