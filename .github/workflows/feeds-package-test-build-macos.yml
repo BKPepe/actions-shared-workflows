@@ -1,0 +1,672 @@
+name: Feeds Package Test Build macOS
+
+# macOS counterpart of multi-arch-test-build.yml. There is no prebuilt SDK
+# container for macOS, so this workflow restores the SDK parts published by
+# macos-toolchain.yml (host tools, package manager host tools, toolchain and
+# kernel, built from the same snapshot as the Linux SDK) and then builds the
+# changed feed packages natively, running the same steps openwrt/gh-action-sdk
+# runs on Linux. It has no step that builds those parts and needs no secrets. macOS
+# runners cannot run Docker or QEMU, so the packages built there are runtime
+# tested in a follow-up Linux job, exactly like multi-arch-test-build.yml does.
+#
+# Keep the shared parts in sync with multi-arch-test-build.yml (last synced
+# with 2eeb2b6).
+
+on:
+  workflow_call:
+    inputs:
+      enable_generic_tests:
+        type: boolean
+        default: true
+      force_generic_tests:
+        type: boolean
+        default: true
+      matrix:
+        description: 'JSON string of the build matrix'
+        required: false
+        type: string
+        default: ''
+      packages:
+        description: 'Space-separated packages to build (empty = changed packages, or the feed default set)'
+        required: false
+        type: string
+        default: ''
+      feed_repository:
+        description: 'Feed repository (owner/name) to test instead of the checked-out workspace'
+        required: false
+        type: string
+        default: ''
+      branch:
+        description: 'OpenWrt branch (empty = derived from the pull request base branch)'
+        required: false
+        type: string
+        default: ''
+      sdk_url:
+        description: 'Base URL serving the published macOS toolchain manifests and archives'
+        required: false
+        type: string
+        default: https://s3-ccache.openwrt-ci.ansuel.com
+
+permissions:
+  contents: read
+
+# github.workflow is the caller's name here; keep the group distinct from
+# multi-arch-test-build.yml so both can be called from one workflow.
+concurrency:
+  group: ${{ github.workflow }}-macos-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Test ${{ matrix.arch }} on macOS
+    runs-on: macos-26
+    outputs:
+      branch: ${{ steps.branch.outputs.branch }}
+      feed_dir: ${{ steps.feed.outputs.feed_dir }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix: >-
+        ${{
+          inputs.matrix != '' && fromJSON(inputs.matrix) ||
+          fromJSON('{"include": [
+            {"arch": "aarch64_generic", "target": "armsr-armv8", "runtime_test": true},
+            {"arch": "arm_cortex-a9_vfpv3-d16", "target": "mvebu-cortexa9", "runtime_test": false}
+          ]}')
+        }}
+
+    env:
+      ARCH: ${{ matrix.arch }}
+      TARGET: ${{ matrix.target }}
+      BUILD_DIR: /Volumes/OpenWrt/build
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Determine branch name
+        id: branch
+        env:
+          INPUT_BRANCH: ${{ inputs.branch }}
+        run: |
+          BRANCH="${INPUT_BRANCH:-${GITHUB_BASE_REF#refs/heads/}}"
+          case "$BRANCH" in
+            main|master|openwrt-[0-9]*\.[0-9]*)
+              ;;
+            *)
+              BRANCH="master"
+              ;;
+          esac
+          echo "Building for $BRANCH"
+          echo "BRANCH=$BRANCH" >> $GITHUB_ENV
+          echo "branch=$BRANCH" >> $GITHUB_OUTPUT
+
+      - name: Set up case-sensitive build volume
+        run: |
+          hdiutil create -size 40g -type SPARSE -fs "Case-sensitive APFS" -volname OpenWrt "$RUNNER_TEMP/OpenWrt.sparseimage"
+          hdiutil attach "$RUNNER_TEMP/OpenWrt.sparseimage"
+          mkdir -p "$BUILD_DIR"
+          df -h / /Volumes/OpenWrt
+
+      - name: Determine feed and packages
+        id: feed
+        env:
+          FEED_REPOSITORY: ${{ inputs.feed_repository }}
+          INPUT_PACKAGES: ${{ inputs.packages }}
+        run: |
+          if [ -n "$FEED_REPOSITORY" ]; then
+            FEED_DIR=/Volumes/OpenWrt/feed
+            git clone --depth 1 --branch "$BRANCH" "https://github.com/$FEED_REPOSITORY.git" "$FEED_DIR"
+            REPOSITORY_NAME="${FEED_REPOSITORY#*/}"
+          else
+            FEED_DIR="$GITHUB_WORKSPACE"
+            REPOSITORY_NAME="${GITHUB_REPOSITORY#*/}"
+
+            # only detect packages with changes
+            PKG_ROOTS=$(find . -name Makefile | \
+              grep -v ".*/src/Makefile" | \
+              sed -e 's@./\(.*\)/Makefile@\1/@')
+            CHANGES=$(git diff --diff-filter=d --name-only origin/$BRANCH...)
+
+            for ROOT in $PKG_ROOTS; do
+              for CHANGE in $CHANGES; do
+                if [[ "$CHANGE" == "$ROOT"* ]]; then
+                  PACKAGES+=$(echo "$ROOT" | sed -e 's@\(.*/\)*\(.*\)/@\2 @')
+                  break
+                fi
+              done
+            done
+          fi
+
+          if [ -n "$INPUT_PACKAGES" ]; then
+            PACKAGES="$INPUT_PACKAGES"
+          fi
+
+          # fallback to test packages if nothing explicitly changes this is
+          # should run if other mechanics in packages.git changed
+          if [ "$REPOSITORY_NAME" = "routing" ]; then
+            PACKAGES="${PACKAGES:-bird2 cjdns olsrd}"
+          elif [ "$REPOSITORY_NAME" = "telephony" ]; then
+            PACKAGES="${PACKAGES:-asterisk siproxd freeswitch}"
+          elif [ "$REPOSITORY_NAME" = "luci" ]; then
+            PACKAGES="${PACKAGES:-luci-app-commands}"
+          else
+            PACKAGES="${PACKAGES:-vim attendedsysupgrade-common bmon}"
+          fi
+
+          echo "Building $PACKAGES from $FEED_DIR"
+          echo "FEED_DIR=$FEED_DIR" >> $GITHUB_ENV
+          # packages record this physical path as their origin
+          echo "feed_dir=$(cd "$FEED_DIR" && pwd -P)" >> $GITHUB_OUTPUT
+          echo "PACKAGES=$PACKAGES" >> $GITHUB_ENV
+
+      - name: Install build dependencies
+        run: |
+          # The runner image ships third-party taps; drop them so formulae
+          # resolve from homebrew/core only.
+          for tap in $(brew tap | grep -v '^homebrew/'); do
+            brew untap --force "$tap" || echo "::warning::failed to untap $tap"
+          done
+          brew install \
+            automake \
+            bash \
+            coreutils \
+            diffutils \
+            findutils \
+            gawk \
+            git-extras \
+            gnu-getopt \
+            gnu-sed \
+            gpatch \
+            grep \
+            make \
+            ncurses \
+            pkg-config \
+            python-setuptools \
+            quilt \
+            swig \
+            wget
+
+          # $GITHUB_PATH entries are prepended, so later lines end up earlier
+          # in PATH: GNU tools must come after the system directories here.
+          BREW_PREFIX="$(brew --prefix)"
+          for dir in \
+            "$BREW_PREFIX/bin" \
+            "$BREW_PREFIX/opt/coreutils/bin" \
+            "$BREW_PREFIX/opt/findutils/libexec/gnubin" \
+            "$BREW_PREFIX/opt/gnu-getopt/bin" \
+            "$BREW_PREFIX/opt/gnu-sed/bin" \
+            "$BREW_PREFIX/opt/make/libexec/gnubin" \
+            "$BREW_PREFIX/opt/ncurses/bin" \
+            "$BREW_PREFIX/opt/gawk/libexec/gnubin"; do
+            echo "$dir" >> "$GITHUB_PATH"
+          done
+          echo "PKG_CONFIG_PATH=$BREW_PREFIX/opt/ncurses/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" >> "$GITHUB_ENV"
+
+      - name: Restore prebuilt SDK parts
+        shell: bash
+        env:
+          SDK_URL: ${{ inputs.sdk_url }}
+        run: |
+          SDK_URL="${SDK_URL%/}"
+          MANIFEST="macos-sdk-$BRANCH-$ARCH.json"
+          if ! curl -fsSL "$SDK_URL/$MANIFEST" -o "$RUNNER_TEMP/manifest.json"; then
+            echo "::error::No prebuilt macOS SDK parts are published for $BRANCH/$ARCH ($SDK_URL/$MANIFEST). Run the 'Publish macOS toolchain' workflow first."
+            exit 1
+          fi
+          manifest() { jq -r ".$1 // empty" "$RUNNER_TEMP/manifest.json"; }
+          if [ "$(jq -r '.schema // 1' "$RUNNER_TEMP/manifest.json")" != 2 ] ||
+             [ -z "$(manifest tools)" ] || [ -z "$(manifest toolchain)" ] || [ -z "$(manifest tools_stamp)" ]; then
+            echo "::error::$SDK_URL/$MANIFEST was published by an older version of the 'Publish macOS toolchain' workflow; run it again."
+            exit 1
+          fi
+
+          # BPF packages are built with the runner's Homebrew LLVM the SDK parts
+          # were configured with
+          LLVM_FORMULA=$(manifest llvm_formula)
+          brew --prefix --installed "$LLVM_FORMULA" > /dev/null 2>&1 || brew install "$LLVM_FORMULA"
+          COMMIT=$(jq -r .openwrt_commit "$RUNNER_TEMP/manifest.json")
+          echo "SDK parts were built from snapshot $(jq -r .revision "$RUNNER_TEMP/manifest.json") ($COMMIT)"
+
+          # Check out exactly the core commit the SDK parts were built from.
+          git init -q "$BUILD_DIR"
+          git -C "$BUILD_DIR" remote add origin https://github.com/openwrt/openwrt.git
+          git -C "$BUILD_DIR" fetch -q --depth 1 origin "$COMMIT"
+          git -C "$BUILD_DIR" checkout -q FETCH_HEAD
+
+          # Backdate the core tree so the restored build stamps stay newer than
+          # their sources; otherwise make would rebuild them.
+          find "$BUILD_DIR" -type f -not -path '*/.git/*' -exec touch -t 202001010000.00 {} +
+
+          for part in tools toolchain hostpkg kernel; do
+            ARCHIVE=$(jq -r ".$part // empty" "$RUNNER_TEMP/manifest.json")
+            if [ -z "$ARCHIVE" ]; then
+              echo "No $part archive is published"
+              continue
+            fi
+            echo "Restoring $ARCHIVE"
+            curl -fsSL "$SDK_URL/$ARCHIVE" | zstd -dc -T0 | tar -C "$BUILD_DIR" -xf -
+          done
+          # the host build stamps the archives provide, checked after the build
+          (cd "$BUILD_DIR" && find build_dir/hostpkg staging_dir/host/stamp staging_dir/hostpkg/stamp \
+            \( -name .built -o -name '.*_installed' \) 2>/dev/null || true) > "$RUNNER_TEMP/restored-host-stamps.txt"
+          touch "$RUNNER_TEMP/restore.done"
+
+          manifest config > "$RUNNER_TEMP/macos.config"
+          echo "TOOLS_STAMP=$(manifest tools_stamp)" >> "$GITHUB_ENV"
+          if [ -n "$(manifest kernel)" ]; then
+            # kernel modules take their vermagic from the restored kernel tree
+            KERNEL_VERMAGIC=$(cat "$BUILD_DIR"/build_dir/target-*/linux-*/linux-*/.vermagic 2>/dev/null | head -n1 || true)
+            if [ "$KERNEL_VERMAGIC" != "$(manifest snapshot_vermagic)" ]; then
+              echo "::error::The restored kernel's vermagic '$KERNEL_VERMAGIC' is not the snapshot's '$(manifest snapshot_vermagic)'"
+              exit 1
+            fi
+            echo "HAVE_KERNEL=true" >> "$GITHUB_ENV"
+          else
+            echo "::warning::No kernel is published for $BRANCH/$ARCH; packages that need it are skipped"
+            echo "HAVE_KERNEL=false" >> "$GITHUB_ENV"
+          fi
+
+          {
+            echo "### macOS SDK parts: $BRANCH / $ARCH"
+            jq -r '"Snapshot `\(.revision)` (openwrt `\(.openwrt_commit)`), kernel: \(if .kernel != "" then "vermagic `\(.vermagic)`" else "none" end), runner image `\(.image_version)`"' "$RUNNER_TEMP/manifest.json"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Configure feeds and target
+        working-directory: ${{ env.BUILD_DIR }}
+        run: |
+          # Same feed setup as openwrt/gh-action-sdk: the default feeds from the
+          # GitHub mirrors plus the feed under test as packages_ci.
+          sed \
+            -e 's,https://git.openwrt.org/feed/,https://github.com/openwrt/,' \
+            -e 's,https://git.openwrt.org/openwrt/,https://github.com/openwrt/,' \
+            -e 's,https://git.openwrt.org/project/,https://github.com/openwrt/,' \
+            feeds.conf.default > feeds.conf
+          echo "src-link packages_ci $FEED_DIR" >> feeds.conf
+          cat feeds.conf
+
+          ./scripts/feeds update -a
+
+          # The build configuration of the SDK parts, plus the SDK's default of
+          # enabling every package.
+          cp "$RUNNER_TEMP/macos.config" .config
+          echo "CONFIG_ALL=y" >> .config
+          make defconfig
+
+          # Fail now, with a pointer to the producer, rather than deep in a
+          # package build: package builds never rebuild the restored parts.
+          fail() { echo "::error::$1"; exit 1; }
+          REPUBLISH="republish them with the 'Publish macOS toolchain' workflow"
+          grep -qx 'CONFIG_USE_LLVM_BUILD=y' .config && fail "llvm-bpf would be built as a host tool"
+          # the stamp name encodes which tools this configuration needs
+          printf 'print-tools-stamp:\n\t@echo $(tools/stamp-compile)\n' > "$RUNNER_TEMP/tools-stamp.mk"
+          STAMP=$(OPENWRT_BUILD=1 make -s -f Makefile -f "$RUNNER_TEMP/tools-stamp.mk" print-tools-stamp)
+          STAMP="${STAMP#"$BUILD_DIR"/}"
+          if [ "$STAMP" != "$TOOLS_STAMP" ] || [ ! -e "$STAMP" ]; then
+            fail "This configuration needs $STAMP, but the published host tools provide $TOOLS_STAMP; $REPUBLISH"
+          fi
+          if ! ls staging_dir/toolchain-*/stamp/.gcc_final_installed > /dev/null 2>&1; then
+            fail "The published toolchain is incomplete; $REPUBLISH"
+          fi
+          if grep -qx 'CONFIG_USE_APK=y' .config && [ ! -x staging_dir/host/bin/apk ]; then
+            fail "The published host packages have no apk; $REPUBLISH"
+          fi
+
+      - name: Check packages
+        working-directory: ${{ env.BUILD_DIR }}
+        run: |
+          # The checks openwrt/gh-action-sdk runs before building.
+          for PKG in $PACKAGES; do
+            echo "::group::feeds install -p packages_ci -f $PKG"
+            ./scripts/feeds install -p packages_ci -f "$PKG"
+            # the SDK refreshes .config before every make, which enables it
+            make defconfig
+            echo "::endgroup::"
+
+            echo "::group::make package/$PKG/download"
+            make BUILD_LOG=1 "package/$PKG/download" V=s
+            echo "::endgroup::"
+
+            echo "::group::make package/$PKG/check"
+            make BUILD_LOG=1 "package/$PKG/check" V=s 2>&1 | tee "$RUNNER_TEMP/check.log"
+            RET=${PIPESTATUS[0]}
+            echo "::endgroup::"
+            if [ "$RET" -ne 0 ]; then
+              echo "::error::Package check failed for $PKG"
+              exit "$RET"
+            fi
+            if grep -qE "HASH does not match |HASH uses deprecated hash,|HASH is missing," "$RUNNER_TEMP/check.log"; then
+              echo "::error::Package HASH check failed for $PKG"
+              exit 1
+            fi
+
+            PATCHES_DIR=$(find "$FEED_DIR" -type d -path "*/$PKG/patches" -not -path '*/.git/*' | head -n1)
+            if [ -d "$PATCHES_DIR" ]; then
+              echo "::group::make package/$PKG/refresh"
+              make BUILD_LOG=1 "package/$PKG/refresh" V=s
+              echo "::endgroup::"
+              if ! git -C "$PATCHES_DIR" diff --quiet -- .; then
+                echo "::error::Dirty patches detected in $PKG, please refresh and review the diff"
+                git -C "$PATCHES_DIR" --no-pager diff -- .
+                git -C "$PATCHES_DIR" checkout -- .
+                exit 1
+              fi
+              echo "::group::make package/$PKG/clean"
+              make BUILD_LOG=1 "package/$PKG/clean" V=s
+              echo "::endgroup::"
+            fi
+
+            FILES_DIR=$(find "$FEED_DIR" -type d -path "*/$PKG/files" -not -path '*/.git/*' | head -n1)
+            # The SDK container has no shfmt, so on Linux this check never
+            # rejects anything. shfmt is not installed here either, to match;
+            # install it to enforce the check.
+            if [ -d "$FILES_DIR" ] && command -v shfmt > /dev/null; then
+              find "$FILES_DIR" -name "*.init" -exec shfmt -w -sr -s '{}' \;
+              if ! git -C "$FILES_DIR" diff --quiet -- .; then
+                echo "::error::init script must be formatted. Please run through shfmt -w -sr -s"
+                git -C "$FILES_DIR" --no-pager diff -- .
+                git -C "$FILES_DIR" checkout -- .
+                exit 1
+              fi
+            fi
+          done
+
+      - name: Compile packages
+        working-directory: ${{ env.BUILD_DIR }}
+        run: |
+          if grep -qx 'CONFIG_USE_LLVM_BUILD=y' .config; then
+            echo "::error::An installed package made llvm-bpf a host tool, which the published host tools do not have"
+            exit 1
+          fi
+
+          make \
+            -f .config \
+            -f tmp/.packagedeps \
+            -f <(echo "\$(info \$(sort \$(package-y) \$(package-m)))"; echo -en "a:\n\t@:") \
+              | tr ' ' '\n' > enabled-package-subdirs.txt
+
+          # Prints every compile target that building
+          # package/feeds/packages_ci/$(PKG) would (transitively) build.
+          cat > "$RUNNER_TEMP/compile-closure.mk" <<'MK'
+          deps_of = $(sort $(foreach t,$(1),$($(t))))
+          closure = $(if $(filter-out $(2),$(1)),$(call closure,$(call deps_of,$(filter-out $(2),$(1))),$(sort $(2) $(1))),$(2))
+          $(info $(call closure,package/feeds/packages_ci/$(PKG)/compile,))
+          a: ; @:
+          MK
+          # Used when no kernel is published: the core kernel package, packages
+          # that build their own kernel modules, and packages that build tools
+          # or read headers from the kernel tree need it.
+          needs_kernel() {
+            for target in $(make -s curdir=package PKG="$1" -f .config -f tmp/.packagedeps -f "$RUNNER_TEMP/compile-closure.mk" a); do
+              dir="${target%/compile}"
+              if [ "$dir" = package/kernel/linux ] ||
+                 grep -qsE 'KernelPackage|\$\(LINUX_DIR\)/(tools|include)|KBUILD_OUTPUT="\$\(LINUX_DIR\)"' "$dir/Makefile"; then
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          RET=0
+          COMPILED=""
+          for PKG in $PACKAGES; do
+            if ! grep -m1 -qE "(^|/)$PKG$" enabled-package-subdirs.txt; then
+              echo "::warning file=$PKG::Skipping $PKG due to unsupported architecture"
+              continue
+            fi
+            if [ "$HAVE_KERNEL" != true ] && needs_kernel "$PKG"; then
+              echo "::warning file=$PKG::Skipping $PKG on macOS: it needs the kernel, and none is published for this target"
+              continue
+            fi
+            echo "::group::make package/$PKG/compile"
+            # In the full buildroot the core kernel package also depends on
+            # linux-firmware and gpio-button-hotplug, which the SDK does not
+            # have; build kernel modules without them, as the SDK does.
+            make BUILD_LOG=1 CONFIG_AUTOREMOVE=y V=s -j"$(sysctl -n hw.logicalcpu)" \
+              'package/kernel/linux/compile=' "package/$PKG/compile" || RET=$?
+            echo "::endgroup::"
+            if [ "$RET" -ne 0 ]; then
+              ret=$RET .github/workflows/scripts/show_build_failures.sh logs || true
+              break
+            fi
+            COMPILED="$COMPILED $PKG"
+          done
+
+          echo "::group::make package/index"
+          make CONFIG_SIGNED_PACKAGES= V=s package/index
+          echo "::endgroup::"
+
+          # Package builds only rebuild restored host build stamps when the
+          # published archives do not match this tree.
+          while read -r stamp; do
+            if [ ! -e "$stamp" ] || [ "$stamp" -nt "$RUNNER_TEMP/restore.done" ]; then
+              echo "::warning::$stamp was rebuilt although it was restored; the published archives do not match this tree"
+              break
+            fi
+          done < "$RUNNER_TEMP/restored-host-stamps.txt"
+          if [ -z "$COMPILED" ] && [ "$RET" -eq 0 ]; then
+            echo "::warning::No package was compiled for $ARCH"
+          fi
+          echo "Compiled for $ARCH:${COMPILED:- none}" >> "$GITHUB_STEP_SUMMARY"
+
+          exit "$RET"
+
+      - name: Move created packages to project dir
+        if: always()
+        env:
+          FEED_REPOSITORY: ${{ inputs.feed_repository }}
+        run: |
+          cp -v "$BUILD_DIR/bin/packages/$ARCH/packages_ci/"* . || true
+          cp -r "$BUILD_DIR/logs" . || true
+          if [ -n "$FEED_REPOSITORY" ] && [ -d "$FEED_DIR/.git" ]; then
+            # the runtime tests use the test scripts of the cloned feed commit
+            git -C "$FEED_DIR" rev-parse HEAD > feed-commit || true
+          fi
+
+      - name: Collect metadata
+        if: always()
+        run: |
+          MERGE_ID=$(git rev-parse --short HEAD)
+          if git rev-parse -q --verify HEAD^2 >/dev/null; then
+            BASE_ID=$(git rev-parse --short HEAD^1)
+            HEAD_ID=$(git rev-parse --short HEAD^2)
+          else
+            # not a pull request merge commit (workflow_dispatch, push)
+            BASE_ID=$(git rev-parse --short HEAD^1 2>/dev/null || echo "$MERGE_ID")
+            HEAD_ID=$MERGE_ID
+          fi
+          PRNUMBER=${GITHUB_REF_NAME%/merge}
+          echo "MERGE_ID=$MERGE_ID" >> $GITHUB_ENV
+          echo "BASE_ID=$BASE_ID" >> $GITHUB_ENV
+          echo "HEAD_ID=$HEAD_ID" >> $GITHUB_ENV
+          echo "PRNUMBER=$PRNUMBER" >> $GITHUB_ENV
+          echo "ARCHIVE_NAME=$ARCH-macos-PR${PRNUMBER//\//-}-$MERGE_ID" >> $GITHUB_ENV
+
+      - name: Generate metadata
+        if: always()
+        run: |
+          cat << _EOF_ > PKG-INFO
+          Metadata-Version: 2.1
+          Name: ${{env.ARCHIVE_NAME}}
+          Version: $BRANCH
+          Author: $GITHUB_ACTOR
+          Home-page: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/pull/$PRNUMBER
+          Download-URL: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+          Summary: $PACKAGES
+          Platform: ${{ matrix.arch }}
+
+          Packages for OpenWrt $BRANCH running on ${{ matrix.arch }}, built from PR $PRNUMBER on a macOS runner
+          at commit $HEAD_ID, against $BRANCH at commit $BASE_ID, with merge SHA $MERGE_ID.
+
+          Modified packages:
+          _EOF_
+          for p in $PACKAGES
+          do
+            echo "  "$p >> PKG-INFO
+          done
+          echo >> PKG-INFO
+          echo Full file listing: >> PKG-INFO
+          ls -al *.ipk >> PKG-INFO || true
+          ls -al *.apk >> PKG-INFO || true
+          cat PKG-INFO
+
+      - name: Store packages
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{env.ARCHIVE_NAME}}-packages
+          path: |
+            Packages
+            Packages.*
+            *.ipk
+            packages.adb
+            *.apk
+            PKG-INFO
+            feed-commit
+
+      - name: Store logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{env.ARCHIVE_NAME}}-logs
+          path: |
+            logs/
+            PKG-INFO
+
+      # Runtime tests run in a separate job; on Linux they run in the same job,
+      # only when its build succeeded. This marker keeps that per architecture.
+      - name: Mark build as successful
+        run: touch "$RUNNER_TEMP/build-ok"
+
+      - name: Store build success marker
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.arch }}-macos-build-ok
+          path: ${{ runner.temp }}/build-ok
+
+  test:
+    name: Runtime test ${{ matrix.arch }}
+    needs: build
+    if: ${{ !cancelled() && needs.build.outputs.branch != '' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: >-
+        ${{
+          inputs.matrix != '' && fromJSON(inputs.matrix) ||
+          fromJSON('{"include": [
+            {"arch": "aarch64_generic", "target": "armsr-armv8", "runtime_test": true},
+            {"arch": "arm_cortex-a9_vfpv3-d16", "target": "mvebu-cortexa9", "runtime_test": false}
+          ]}')
+        }}
+
+    env:
+      BRANCH: ${{ needs.build.outputs.branch }}
+
+    steps:
+      - name: Check the macOS build succeeded
+        id: built
+        if: ${{ matrix.runtime_test }}
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ matrix.arch }}-macos-build-ok
+          path: ${{ runner.temp }}/build-ok
+
+      - name: Download packages built on macOS
+        if: ${{ matrix.runtime_test && steps.built.outcome == 'success' }}
+        uses: actions/download-artifact@v8
+        with:
+          pattern: ${{ matrix.arch }}-macos-*-packages
+          merge-multiple: true
+
+      - name: Check if any packages were built
+        run: |
+          if [ -n "$(find . -maxdepth 1 -type f -name '*.apk' -print -quit)" ]; then
+            echo "Found *.apk files"
+            HAVE_PKGS=true
+            PKG_MANAGER=apk
+          elif [ -n "$(find . -maxdepth 1 -type f -name '*.ipk' -print -quit)" ]; then
+            echo "Found *.ipk files"
+            HAVE_PKGS=true
+            PKG_MANAGER=opkg
+          else
+            echo "No *.apk or *.ipk files found"
+            HAVE_PKGS=false
+          fi
+          echo "HAVE_PKGS=$HAVE_PKGS" >> $GITHUB_ENV
+          echo "PKG_MANAGER=$PKG_MANAGER" >> $GITHUB_ENV
+
+      - name: Checkout feed
+        if: ${{ matrix.runtime_test && fromJSON(env.HAVE_PKGS) && inputs.feed_repository == '' }}
+        uses: actions/checkout@v7
+        with:
+          path: feed
+          persist-credentials: false
+
+      - name: Clone feed
+        if: ${{ matrix.runtime_test && fromJSON(env.HAVE_PKGS) && inputs.feed_repository != '' }}
+        env:
+          FEED_REPOSITORY: ${{ inputs.feed_repository }}
+        run: |
+          # the commit the packages were built from, not the branch as it is now
+          FEED_COMMIT=$(cat feed-commit 2>/dev/null || true)
+          if [ -z "$FEED_COMMIT" ]; then
+            echo "::error::The macOS build did not record which feed commit it built"
+            exit 1
+          fi
+          git init -q feed
+          git -C feed fetch -q --depth 1 "https://github.com/$FEED_REPOSITORY.git" "$FEED_COMMIT"
+          git -C feed checkout -q FETCH_HEAD
+
+      - name: Register QEMU
+        if: ${{ matrix.runtime_test && fromJSON(env.HAVE_PKGS) }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static binfmt-support
+          sudo update-binfmts --import
+
+      - name: Checkout test scripts
+        if: ${{ matrix.runtime_test && fromJSON(env.HAVE_PKGS) }}
+        uses: actions/checkout@v7
+        with:
+          repository: openwrt/actions-shared-workflows
+          path: workflow_context
+          sparse-checkout: |
+            .github/scripts/ci_helpers.sh
+            .github/dockerfiles/Dockerfile.feeds
+            .github/scripts/test_entrypoint.sh
+          sparse-checkout-cone-mode: false
+
+      - name: Build Docker container
+        if: ${{ matrix.runtime_test && fromJSON(env.HAVE_PKGS) }}
+        run: |
+          docker build \
+            --build-arg ARCH \
+            --file workflow_context/.github/dockerfiles/Dockerfile.feeds \
+            --platform linux/${{ matrix.arch }} \
+            --tag test-container \
+            workflow_context/.github
+        env:
+          ARCH: ${{ matrix.arch }}-${{ env.BRANCH }}
+
+      - name: Test via Docker container
+        if: ${{ matrix.runtime_test && fromJSON(env.HAVE_PKGS) }}
+        env:
+          FEED_DIR: ${{ needs.build.outputs.feed_dir }}
+        run: |
+          # Packages record the path of the feed they were built from as their
+          # origin, and test_entrypoint.sh looks for test.sh under /ci/<origin>.
+          # The SDK builds from /feed, which the script strips; on macOS it is
+          # an absolute path, so mount the feed there as well.
+          docker run \
+            -e ENABLE_GENERIC_TESTS=${{ inputs.enable_generic_tests }} \
+            -e FORCE_GENERIC_TESTS=${{ inputs.force_generic_tests }} \
+            -e PKG_MANAGER=${{ env.PKG_MANAGER }} \
+            --platform linux/${{ matrix.arch }} \
+            --rm \
+            --volume $GITHUB_WORKSPACE:/ci \
+            --volume "$GITHUB_WORKSPACE/feed:/ci$FEED_DIR" \
+            test-container
