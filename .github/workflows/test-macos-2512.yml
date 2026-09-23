@@ -1,0 +1,29 @@
+name: Test macOS openwrt-25.12 (temporary)
+
+on:
+  push:
+    branches:
+      - macos-parity-test
+
+jobs:
+  producer:
+    uses: ./.github/workflows/reusable_macos-toolchain.yml
+    with:
+      branch: openwrt-25.12
+      sdk_url: ${{ vars.MACOS_SDK_URL }}
+      force: true
+    secrets:
+      s3_endpoint: ${{ secrets.ccache_s3_endpoint || secrets.s3_endpoint }}
+      s3_bucket: ${{ secrets.ccache_s3_bucket || secrets.s3_bucket }}
+      s3_access_key: ${{ secrets.ccache_s3_access_key || secrets.s3_access_key }}
+      s3_secret_key: ${{ secrets.ccache_s3_secret_key || secrets.s3_secret_key }}
+
+  consumer:
+    needs: producer
+    if: ${{ !cancelled() && vars.MACOS_SDK_URL != '' }}
+    uses: ./.github/workflows/feeds-package-test-build-macos.yml
+    with:
+      feed_repository: openwrt/packages
+      packages: vim tinc
+      branch: openwrt-25.12
+      sdk_url: ${{ vars.MACOS_SDK_URL }}
